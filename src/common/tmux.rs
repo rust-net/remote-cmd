@@ -1,9 +1,10 @@
 use std::sync::LazyLock;
 
 /// Pane 相关参数
+#[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
-    /// pane_id：窗格的唯一 ID（如 %1），比 TMUX_PANE 更底层。
+    /// pane_id：窗格的唯一 ID，环境变量 $TMUX_PANE 也含有该值，作为查询目标时应使用 %pane_id 格式。
     pub pane_id: u32,
     /// pane_pid：窗格中第一个进程的 PID。
     pub pane_pid: u32,
@@ -13,7 +14,16 @@ pub struct TmuxPane {
     pub pane_current_path: String,
 }
 
+#[allow(unused)]
+impl TmuxPane {
+    /// 获取窗格的查询目标字符串（%pane_id）
+    pub fn target(&self) -> String {
+        format!("%{}", self.pane_id)
+    }
+}
+
 /// Client 相关参数
+#[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     /// client_tty：客户端伪终端路径（如 /dev/pts/1）。
@@ -24,6 +34,27 @@ pub struct TmuxClient {
     pub client_name: String,
     /// client_session：客户端当前附加到的会话名称。
     pub client_session: String,
+    /// session_id：会话 ID，作为查询目标时应使用 $session_id 格式。
+    pub session_id: u32,
+    /// session_name：会话名称。
+    pub session_name: String,
+    /// window_id：窗口 ID，作为查询目标时应使用 @window_id 格式。
+    pub window_id: u32,
+    /// window_name：窗口名称。
+    pub window_name: String,
+}
+
+#[allow(unused)]
+impl TmuxClient {
+    /// 获取客户端连接会话的查询目标字符串（$session_id）
+    pub fn session_target(&self) -> String {
+        format!("${}", self.session_id)
+    }
+
+    /// 获取客户端活动窗口的查询目标字符串（@window_id）
+    pub fn window_target(&self) -> String {
+        format!("@{}", self.window_id)
+    }
 }
 
 /// Pane 查询格式化字符串
@@ -56,12 +87,16 @@ impl ClientFormat {
     /// 格式化字符串
     const FORMAT: LazyLock<String> = LazyLock::new(|| {
         format!(
-            r#"{1}{0}{2}{0}{3}{0}{4}"#,
+            r#"{1}{0}{2}{0}{3}{0}{4}{0}{5}{0}{6}{0}{7}{0}{8}"#,
             Self::SEPARATOR,
             "#{client_tty}",
             "#{client_pid}",
             "#{client_name}",
-            "#{client_session}"
+            "#{client_session}",
+            "#{session_id}",
+            "#{session_name}",
+            "#{window_id}",
+            "#{window_name}"
         )
     });
 }
@@ -84,17 +119,28 @@ fn parse_pane_output(output: &str) -> Option<TmuxPane> {
 }
 
 /// 解析 list-clients 单行输出为 TmuxClient
+///
+/// 输出格式为 `/dev/pts/1:1563:/dev/pts/1:main:$3:main:@3:bash`，
+/// 其中 session_id 带 `$` 前缀、window_id 带 `@` 前缀（与 pane_id 的 `%` 前缀一致）。
 fn parse_client_output(line: &str) -> Option<TmuxClient> {
-    let mut parts = line.splitn(4, ClientFormat::SEPARATOR);
+    let mut parts = line.splitn(8, ClientFormat::SEPARATOR);
     let client_tty = parts.next()?;
     let client_pid = parts.next()?;
     let client_name = parts.next()?;
     let client_session = parts.next()?;
+    let session_id = parts.next()?;
+    let session_name = parts.next()?;
+    let window_id = parts.next()?;
+    let window_name = parts.next()?;
     Some(TmuxClient {
         client_tty: client_tty.to_string(),
         client_pid: client_pid.parse().ok()?,
         client_name: client_name.to_string(),
         client_session: client_session.to_string(),
+        session_id: session_id.strip_prefix('$')?.parse().ok()?,
+        session_name: session_name.to_string(),
+        window_id: window_id.strip_prefix('@')?.parse().ok()?,
+        window_name: window_name.to_string(),
     })
 }
 
@@ -161,8 +207,8 @@ mod tests {
     #[tokio::test]
     async fn test_query_tmux() {
         let socket = None;
-        let target = None;
         let clients = query_tmux_clients(socket).await;
+        let target = Some(clients[clients.len() - 1].window_target());
         let pane = query_tmux_pane(socket, target).await;
         dbg!(&clients);
         dbg!(&pane);
@@ -178,7 +224,7 @@ mod tests {
         );
         assert_eq!(
             ClientFormat::FORMAT.as_str(),
-            "#{client_tty}:#{client_pid}:#{client_name}:#{client_session}"
+            "#{client_tty}:#{client_pid}:#{client_name}:#{client_session}:#{session_id}:#{session_name}:#{window_id}:#{window_name}"
         );
     }
 
@@ -207,16 +253,27 @@ mod tests {
 
     #[test]
     fn test_parse_client_output() {
-        let client = parse_client_output("/dev/pts/1:5678:tmux-256color:main").unwrap();
-        assert_eq!(client.client_tty, "/dev/pts/1");
-        assert_eq!(client.client_pid, 5678);
-        assert_eq!(client.client_name, "tmux-256color");
-        assert_eq!(client.client_session, "main");
+        // 依据真实 tmux 输出构造：session_id 带 $ 前缀，window_id 带 @ 前缀
+        let client = parse_client_output("/dev/pty0:1563:/dev/pty0:3:$3:3:@3:bash").unwrap();
+        assert_eq!(client.client_tty, "/dev/pty0");
+        assert_eq!(client.client_pid, 1563);
+        assert_eq!(client.client_name, "/dev/pty0");
+        assert_eq!(client.client_session, "3");
+        assert_eq!(client.session_id, 3);
+        assert_eq!(client.session_name, "3");
+        assert_eq!(client.window_id, 3);
+        assert_eq!(client.window_name, "bash");
     }
 
     #[test]
     fn test_parse_client_output_invalid() {
         assert!(parse_client_output("").is_none());
         assert!(parse_client_output("/dev/pts/1:not_a_pid:name:session").is_none());
+        // 字段数量不足（格式串共 8 个字段）
+        assert!(parse_client_output("/dev/pts/1:1:name:session").is_none());
+        // session_id 缺少 $ 前缀
+        assert!(parse_client_output("/dev/pts/1:1:n:s:3:s:@3:w").is_none());
+        // window_id 缺少 @ 前缀
+        assert!(parse_client_output("/dev/pts/1:1:n:s:$3:s:3:w").is_none());
     }
 }

@@ -1,5 +1,7 @@
 use portable_pty::{Child, CommandBuilder, PtySize};
 
+use crate::common::tmux;
+
 #[allow(unused)]
 fn run(program: &str, args: &[&str], cwd: Option<&str>) -> Option<Box<dyn Child + Send + Sync>> {
     let pty_system = portable_pty::native_pty_system();
@@ -101,10 +103,10 @@ async fn tmux_pane_cwd(shell_pid: u32) -> Option<String> {
     };
     // 目标会话：优先 list-clients 按控制终端实时匹配（覆盖 attach / switch-client
     // 后 TMUX env 会话 id 过期的场景），失败回退 env 中客户端启动时挂接的会话
-    let tty_target = client_session_by_tty(&socket, shell_pid).await;
+    let tty_target = client_session_by_pid(Some(&socket), shell_pid).await;
     macro_log::d!("[cwd] 目标会话: tty 匹配={tty_target:?} env 回退={env_target:?}");
     let target = tty_target.or(env_target);
-    let r = query_tmux_pane_cwd(&socket, target.clone()).await;
+    let r = query_tmux_pane_cwd(Some(&socket), target.clone()).await;
     macro_log::d!("[cwd] pane cwd 查询: socket={socket} target={target:?} -> {r:?}");
     r
 }
@@ -125,72 +127,54 @@ fn parse_tmux_env(env: &str) -> Option<(String, Option<String>)> {
     Some((socket.to_string(), target))
 }
 
-/// 按控制终端路径匹配 tmux 客户端当前挂接的会话（list-clients）。
+/// 获取进程 stdin 控制终端路径（/dev/pts/N、/dev/tty、/dev/pty）
+#[cfg(unix)]
+fn proc_stdin_tty(pid: u32) -> Option<String> {
+    let path = std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
+    let s = path.to_string_lossy();
+    // 只接受 tty 设备路径
+    if s.starts_with("/dev/pts/") || s.starts_with("/dev/tty") || s.starts_with("/dev/pty") {
+        Some(s.into_owned())
+    } else {
+        None
+    }
+}
+
+/// 按控制终端路径匹配 tmux 客户端当前连接的会话（list-clients）。
+#[allow(unused)]
+async fn client_session_by_tty(socket: Option<&str>, tty: &str) -> Option<String> {
+    let clients = tmux::query_tmux_clients(socket).await;
+    clients
+        .iter()
+        .find(|c| c.client_tty == tty)
+        .map(|c| c.session_target())
+}
+
+/// 按进程 pid 匹配 tmux 客户端当前连接的会话（list-clients）。
 /// TMUX env 的会话 id 仅在客户端启动时写入，switch-client 后过期；
 /// 此处读外层 shell 的 fd/0 符号链接（/dev/pts/N）与 #{client_tty} 比对，以
 /// server 的实时归属为准。返回 tmux 唯一会话 id（"$<n>"，可直接作 -t 目标）。
 #[cfg(unix)]
-async fn client_session_by_tty(socket: &str, shell_pid: u32) -> Option<String> {
-    let tty = std::fs::read_link(format!("/proc/{shell_pid}/fd/0"))
-        .ok()?
-        .to_string_lossy()
-        .into_owned();
-    let mut cmd = tokio::process::Command::new("tmux");
-    cmd.arg("-S")
-        .arg(socket)
-        .arg("list-clients")
-        // 其实可以不必列出所有 client，直接按 tty 过滤即可
-        // 不过需要 tmux 3.3 版本开始支持
-        // .arg("-f")
-        // .arg(&format!("#{==:#{client_tty},{}]", tty))
-        .arg("-F")
-        // 其实这里就可以拿到 #{pane_current_path} 甚至 #{pane_pid}、 #{pane_current_command} 了
-        // 因为一个 client 只有一个活动 session，一个 session 只有一个活动 window， 一个 window 通常只有一个活动 pane
-        // 所以 #{pane_current_path} 等变量都是唯一的，这里可以直接用 #{client_tty} 匹配即可
-        // 目前只匹配 session_id，后续再根据 session_id 查询 pane_current_path
-        .arg("#{client_tty}|#{session_id}");
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
-    let out = tokio::time::timeout(std::time::Duration::from_secs(2), cmd.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
+async fn client_session_by_pid(socket: Option<&str>, pid: u32) -> Option<String> {
+    let Some(tty) = proc_stdin_tty(pid) else {
         return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find(|l| l.starts_with(&tty) && l[tty.len()..].starts_with('|'))
-        .and_then(|l| l.split_once('|').map(|(_, s)| s.trim().to_string()))
-        .filter(|s| {
-            s.len() > 1
-                && s.starts_with('$')
-                && s[1..].chars().all(|c| c.is_ascii_digit())
-        })
+    };
+    client_session_by_tty(socket, &tty).await
 }
 
 /// 执行 tmux display-message 查询活动 pane 的当前路径（2s 超时，防 tmux server 卡死拖住上传）
-#[cfg(unix)]
-async fn query_tmux_pane_cwd(socket: &str, target: Option<String>) -> Option<String> {
-    let mut cmd = tokio::process::Command::new("tmux");
-    cmd.arg("-S").arg(socket).arg("display-message").arg("-p");
-    if let Some(t) = &target {
-        cmd.arg("-t").arg(t);
-    }
-    cmd.arg("#{pane_current_path}");
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
-    let out = tokio::time::timeout(std::time::Duration::from_secs(2), cmd.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
+#[allow(unused)]
+async fn query_tmux_pane_cwd(socket: Option<&str>, target: Option<String>) -> Option<String> {
+    let Some(pane) = tmux::query_tmux_pane(socket, target).await else {
         return None;
+    };
+    let dir = pane.pane_current_path;
+    if cfg!(windows) {
+        dir.starts_with('/')
+    } else {
+        dir.starts_with('/') && std::path::Path::new(&dir).is_dir()
     }
-    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (dir.starts_with('/') && std::path::Path::new(&dir).is_dir()).then_some(dir)
+    .then_some(dir)
 }
 
 /// 在全进程表中查找控制终端与 shell 相同的 tmux 客户端。
@@ -297,5 +281,24 @@ mod tests {
         macro_log::i!("当前工作目录: {}", cwd);
         assert!(!cwd.is_empty());
         assert_eq!(cwd, "/tmp");
+    }
+
+    #[tokio::test]
+    async fn test_client_session_by_tty() {
+        let socket = None;
+        let tty = "/dev/pty0";
+        let session = client_session_by_tty(socket, tty).await;
+        dbg!(&session);
+        assert!(session.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_query_tmux_pane_cwd() {
+        let socket = None;
+        let tty = "/dev/cons0";
+        let session = client_session_by_tty(socket, tty).await;
+        let cwd = query_tmux_pane_cwd(socket, session).await;
+        dbg!(&cwd);
+        assert!(cwd.is_some());
     }
 }
