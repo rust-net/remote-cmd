@@ -139,7 +139,15 @@ async fn client_session_by_tty(socket: &str, shell_pid: u32) -> Option<String> {
     cmd.arg("-S")
         .arg(socket)
         .arg("list-clients")
+        // 其实可以不必列出所有 client，直接按 tty 过滤即可
+        // 不过需要 tmux 3.3 版本开始支持
+        // .arg("-f")
+        // .arg(&format!("#{==:#{client_tty},{}]", tty))
         .arg("-F")
+        // 其实这里就可以拿到 #{pane_current_path} 甚至 #{pane_pid}、 #{pane_current_command} 了
+        // 因为一个 client 只有一个活动 session，一个 session 只有一个活动 window， 一个 window 通常只有一个活动 pane
+        // 所以 #{pane_current_path} 等变量都是唯一的，这里可以直接用 #{client_tty} 匹配即可
+        // 目前只匹配 session_id，后续再根据 session_id 查询 pane_current_path
         .arg("#{client_tty}|#{session_id}");
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());

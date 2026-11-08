@@ -4,6 +4,7 @@ pub mod fingerprint;
 pub mod json_file;
 pub mod net;
 pub mod paths;
+pub mod tmux;
 pub mod self_update;
 
 use std::io;
