@@ -63,7 +63,7 @@ struct PaneFormat;
 
 impl PaneFormat {
     /// 分隔符
-    const SEPARATOR: &str = ":";
+    const SEPARATOR: &str = "\t";
     /// 格式化字符串
     const FORMAT: LazyLock<String> = LazyLock::new(|| {
         format!(
@@ -82,8 +82,8 @@ impl PaneFormat {
 struct ClientFormat;
 
 impl ClientFormat {
-    /// 分隔符
-    const SEPARATOR: &str = ":";
+    /// 分隔符：tmux 会话名可含 `:`（session_name 位于中间字段，冒号会导致字段错位），故用制表符
+    const SEPARATOR: &str = "\t";
     /// 格式化字符串
     const FORMAT: LazyLock<String> = LazyLock::new(|| {
         format!(
@@ -120,7 +120,7 @@ fn parse_pane_output(output: &str) -> Option<TmuxPane> {
 
 /// 解析 list-clients 单行输出为 TmuxClient
 ///
-/// 输出格式为 `/dev/pts/1:1563:/dev/pts/1:main:$3:main:@3:bash`，
+/// 输出为制表符分隔的 8 个字段，如 `/dev/pts/1⇥1563⇥/dev/pts/1⇥main⇥$3⇥main⇥@3⇥bash`，
 /// 其中 session_id 带 `$` 前缀、window_id 带 `@` 前缀（与 pane_id 的 `%` 前缀一致）。
 fn parse_client_output(line: &str) -> Option<TmuxClient> {
     let mut parts = line.splitn(8, ClientFormat::SEPARATOR);
@@ -208,7 +208,8 @@ mod tests {
     async fn test_query_tmux() {
         let socket = None;
         let clients = query_tmux_clients(socket).await;
-        let target = Some(clients[clients.len() - 1].window_target());
+        assert!(clients.len() > 0, "本机 tmux 无附加客户端，无法构造查询目标");
+        let target = Some(clients.last().unwrap().window_target());
         let pane = query_tmux_pane(socket, target).await;
         dbg!(&clients);
         dbg!(&pane);
@@ -220,17 +221,17 @@ mod tests {
     fn test_format() {
         assert_eq!(
             PaneFormat::FORMAT.as_str(),
-            "#{pane_id}:#{pane_pid}:#{pane_current_command}:#{pane_current_path}"
+            "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"
         );
         assert_eq!(
             ClientFormat::FORMAT.as_str(),
-            "#{client_tty}:#{client_pid}:#{client_name}:#{client_session}:#{session_id}:#{session_name}:#{window_id}:#{window_name}"
+            "#{client_tty}\t#{client_pid}\t#{client_name}\t#{client_session}\t#{session_id}\t#{session_name}\t#{window_id}\t#{window_name}"
         );
     }
 
     #[test]
     fn test_parse_pane_output() {
-        let pane = parse_pane_output("%1:1234:bash:/home/user").unwrap();
+        let pane = parse_pane_output("%1\t1234\tbash\t/home/user").unwrap();
         assert_eq!(pane.pane_id, 1);
         assert_eq!(pane.pane_pid, 1234);
         assert_eq!(pane.pane_current_command, "bash");
@@ -239,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_parse_pane_output_path_with_colon() {
-        let pane = parse_pane_output("%12:99:zsh:/opt/a:b/c").unwrap();
+        let pane = parse_pane_output("%12\t99\tzsh\t/opt/a:b/c").unwrap();
         assert_eq!(pane.pane_id, 12);
         assert_eq!(pane.pane_current_path, "/opt/a:b/c");
     }
@@ -247,14 +248,15 @@ mod tests {
     #[test]
     fn test_parse_pane_output_invalid() {
         assert!(parse_pane_output("").is_none());
-        assert!(parse_pane_output("%1:not_a_pid:bash:/tmp").is_none());
-        assert!(parse_pane_output("1:1234:bash:/tmp").is_none()); // 缺少 % 前缀
+        assert!(parse_pane_output("%1\tnot_a_pid\tbash\t/tmp").is_none());
+        assert!(parse_pane_output("1\t1234\tbash\t/tmp").is_none()); // 缺少 % 前缀
     }
 
     #[test]
     fn test_parse_client_output() {
         // 依据真实 tmux 输出构造：session_id 带 $ 前缀，window_id 带 @ 前缀
-        let client = parse_client_output("/dev/pty0:1563:/dev/pty0:3:$3:3:@3:bash").unwrap();
+        let client =
+            parse_client_output("/dev/pty0\t1563\t/dev/pty0\t3\t$3\t3\t@3\tbash").unwrap();
         assert_eq!(client.client_tty, "/dev/pty0");
         assert_eq!(client.client_pid, 1563);
         assert_eq!(client.client_name, "/dev/pty0");
@@ -268,12 +270,12 @@ mod tests {
     #[test]
     fn test_parse_client_output_invalid() {
         assert!(parse_client_output("").is_none());
-        assert!(parse_client_output("/dev/pts/1:not_a_pid:name:session").is_none());
+        assert!(parse_client_output("/dev/pts/1\tnot_a_pid\tname\tsession").is_none());
         // 字段数量不足（格式串共 8 个字段）
-        assert!(parse_client_output("/dev/pts/1:1:name:session").is_none());
+        assert!(parse_client_output("/dev/pts/1\t1\tname\tsession").is_none());
         // session_id 缺少 $ 前缀
-        assert!(parse_client_output("/dev/pts/1:1:n:s:3:s:@3:w").is_none());
+        assert!(parse_client_output("/dev/pts/1\t1\tn\ts\t3\ts\t@3\tw").is_none());
         // window_id 缺少 @ 前缀
-        assert!(parse_client_output("/dev/pts/1:1:n:s:$3:s:3:w").is_none());
+        assert!(parse_client_output("/dev/pts/1\t1\tn\ts\t$3\ts\t3\tw").is_none());
     }
 }
