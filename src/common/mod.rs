@@ -4,8 +4,12 @@ pub mod fingerprint;
 pub mod json_file;
 pub mod net;
 pub mod paths;
+pub mod pty;
 pub mod tmux;
 pub mod self_update;
+
+#[cfg(unix)]
+pub mod unix;
 
 use std::io;
 use thiserror::Error;

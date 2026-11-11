@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 /// Pane 相关参数
 #[allow(unused)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxPane {
     /// pane_id：窗格的唯一 ID，环境变量 $TMUX_PANE 也含有该值，作为查询目标时应使用 %pane_id 格式。
     pub pane_id: u32,
@@ -24,7 +24,7 @@ impl TmuxPane {
 
 /// Client 相关参数
 #[allow(unused)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxClient {
     /// client_tty：客户端伪终端路径（如 /dev/pts/1）。
     pub client_tty: String,
@@ -54,6 +54,12 @@ impl TmuxClient {
     /// 获取客户端活动窗口的查询目标字符串（@window_id）
     pub fn window_target(&self) -> String {
         format!("@{}", self.window_id)
+    }
+
+    /// 获取客户端活动窗格
+    pub async fn get_active_pane(&self) -> Option<TmuxPane>  {
+        let target = format!("{}:{}", self.session_target(), self.window_target());
+        query_tmux_pane(None, Some(target)).await
     }
 }
 
@@ -215,6 +221,10 @@ mod tests {
         dbg!(&pane);
         assert!(clients.len() > 0);
         assert!(pane.is_some());
+        let pane1 = clients.last().unwrap().get_active_pane().await;
+        dbg!(&pane1);
+        assert!(pane1.is_some());
+        assert_eq!(pane1, pane);
     }
 
     #[test]

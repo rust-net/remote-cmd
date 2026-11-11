@@ -1,38 +1,6 @@
-use portable_pty::{Child, CommandBuilder, PtySize};
+#![allow(unused)]
 
 use crate::common::tmux;
-
-#[allow(unused)]
-fn run(program: &str, args: &[&str], cwd: Option<&str>) -> Option<Box<dyn Child + Send + Sync>> {
-    let pty_system = portable_pty::native_pty_system();
-    let pair = match pty_system.openpty(PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("打开 PTY 失败: {:?}", e);
-            return None;
-        }
-    };
-
-    let mut cmd = CommandBuilder::new(program);
-    cmd.args(args);
-    if let Some(cwd) = cwd {
-        cmd.cwd(cwd);
-    }
-    let child = match pair.slave.spawn_command(cmd) {
-        Ok(c) => c,
-        Err(err) => {
-            macro_log::w!("PTY 启动进程失败 {}: {err}", program);
-            return None;
-        }
-    };
-    drop(pair.slave); // 父进程立即释放 slave 端
-    Some(child)
-}
 
 #[cfg(unix)]
 pub fn get_cwd(pid: u32) -> Result<String, std::io::Error> {
@@ -61,10 +29,17 @@ pub fn get_cwd(_pid: u32) -> Result<String, std::io::Error> {
 /// 2. 无 tmux / 查询失败 → /proc/<pid>/cwd（普通 shell 的实时 cwd）。
 #[cfg(unix)]
 pub async fn resolve_process_cwd(pid: u32) -> Option<String> {
-    if let Some(dir) = tmux_pane_cwd(pid).await {
-        return Some(dir);
+    use crate::common::unix::*;
+
+    match find_client_type(pid).await {
+        ClientType::TmuxClient(tmux) => {
+            let Some(pane) = tmux.get_active_pane().await else {
+                return None;
+            };
+            Some(pane.pane_current_path)
+        }
+        _ => get_cwd(pid).ok(),
     }
-    get_cwd(pid).ok()
 }
 
 /// 非 Unix：无 /proc 与 tmux 语义，直接回退默认目录
@@ -127,19 +102,6 @@ fn parse_tmux_env(env: &str) -> Option<(String, Option<String>)> {
     Some((socket.to_string(), target))
 }
 
-/// 获取进程 stdin 控制终端路径（/dev/pts/N、/dev/tty、/dev/pty）
-#[cfg(unix)]
-fn proc_stdin_tty(pid: u32) -> Option<String> {
-    let path = std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
-    let s = path.to_string_lossy();
-    // 只接受 tty 设备路径
-    if s.starts_with("/dev/pts/") || s.starts_with("/dev/tty") || s.starts_with("/dev/pty") {
-        Some(s.into_owned())
-    } else {
-        None
-    }
-}
-
 /// 按控制终端路径匹配 tmux 客户端当前连接的会话（list-clients）。
 #[allow(unused)]
 async fn client_session_by_tty(socket: Option<&str>, tty: &str) -> Option<String> {
@@ -156,7 +118,9 @@ async fn client_session_by_tty(socket: Option<&str>, tty: &str) -> Option<String
 /// server 的实时归属为准。返回 tmux 唯一会话 id（"$<n>"，可直接作 -t 目标）。
 #[cfg(unix)]
 async fn client_session_by_pid(socket: Option<&str>, pid: u32) -> Option<String> {
-    let Some(tty) = proc_stdin_tty(pid) else {
+    use crate::common::unix::proc_stdin_tty;
+
+    let Some(tty) = proc_stdin_tty(Some(pid)) else {
         return None;
     };
     client_session_by_tty(socket, &tty).await
@@ -256,31 +220,6 @@ mod tests {
         assert!(parse_tmux_env("").is_none());
         // 控制字符 socket → None
         assert!(parse_tmux_env("/tmp/a\nb,1,0").is_none());
-    }
-
-    // #[tokio::test]
-    #[allow(unused)] // 手动联调实验，默认停用
-    async fn test_run() {
-        let child = run("conhost", &["--", "cmd"], Some("D:\\"));
-        // let child = run("conhost", &["--", "cmd"], None);
-        assert!(child.is_some());
-        let mut child = child.unwrap();
-        // 获取 pid
-        let pid = child.process_id().unwrap();
-        macro_log::i!("子进程 PID: {}", pid);
-        assert!(pid > 0);
-        let _ = child.wait();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_get_cwd() {
-        let child = run("bash", &["-c", "sleep 1"], Some("/tmp")).unwrap();
-        let pid = child.process_id().unwrap();
-        let cwd = get_cwd(pid).unwrap();
-        macro_log::i!("当前工作目录: {}", cwd);
-        assert!(!cwd.is_empty());
-        assert_eq!(cwd, "/tmp");
     }
 
     #[tokio::test]
