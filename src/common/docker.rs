@@ -29,6 +29,46 @@ use futures::StreamExt;
 /// 全局 exec 会话表：由 spawn_watcher 在服务启动时填充，docker 不可用时为空
 static TRACKER: OnceLock<ExecTracker> = OnceLock::new();
 
+/// 服务端自己发起的辅助 exec（同名探测/容器内枚举/mkdir 等）的 id 集。
+/// 事件流里遇到这些 id 直接跳过，避免污染用户的 exec 会话登记表：
+/// 我们无法在事件属性上区分 `-it` 与否，但辅助 exec 全部经 create_own_exec
+/// 创建，登记 id 即可精确识别
+static OWN_EXECS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn own_execs() -> &'static Mutex<std::collections::HashSet<String>> {
+    OWN_EXECS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn mark_own_exec(exec_id: &str) {
+    own_execs().lock().unwrap_or_else(|e| e.into_inner()).insert(exec_id.to_string());
+}
+
+fn take_own_exec(exec_id: &str) -> bool {
+    own_execs().lock().unwrap_or_else(|e| e.into_inner()).remove(exec_id)
+}
+
+/// 创建服务端自身的辅助 exec 并登记 id（exec_die 后由事件处理清除）
+async fn create_own_exec(
+    docker: &Docker,
+    container_id: &str,
+    cmd: Vec<String>,
+) -> anyhow::Result<bollard::exec::CreateExecResults> {
+    let created = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                cmd: Some(cmd),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .context("exec 创建失败")?;
+    mark_own_exec(&created.id);
+    Ok(created)
+}
+
 /// 容器内 cwd 解析结果（上传直接写入容器内，不做宿主 bind 映射）
 #[derive(Clone, Debug)]
 pub struct ContainerCwd {
@@ -138,7 +178,6 @@ async fn run_event_loop(docker: &Docker) -> String {
     let options = EventsOptionsBuilder::new().since(&since).filters(&filters).build();
     let mut events = docker.events(Some(options)).fuse();
     while let Some(msg) = events.next().await {
-        macro_log::d!("[docker] 事件: {:?}", msg);
         let Ok(msg) = msg else {
             return "event stream error".to_string();
         };
@@ -167,6 +206,14 @@ fn handle_event(msg: EventMessage) {
         .cloned()
         .unwrap_or_default();
     let action = msg.action.clone().unwrap_or_default();
+    // 服务端自身的辅助 exec（探测/枚举/mkdir）不进登记表；exec_die 后清除登记
+    if own_execs().lock().unwrap_or_else(|e| e.into_inner()).contains(&exec_id) {
+        if action.starts_with("exec_die") {
+            take_own_exec(&exec_id);
+        }
+        // macro_log::d!("[docker] 跳过自身辅助 exec 事件 action={action} exec={exec_id}");
+        return;
+    }
     macro_log::d!("[docker] 事件 typ={:?} action={action} exec={exec_id} container={container}", msg.typ);
     if exec_id.is_empty() || container.is_empty() {
         return;
@@ -207,8 +254,9 @@ pub async fn resolve_container_cwd(cmdline: &str, client_pid: u32) -> Option<Con
     let container_cwd = match tracked_container_cwd(&docker, &container_ref, &container_id, client_pid).await {
         Some(cwd) => cwd,
         None => {
-            macro_log::d!("[cwd] 无跟踪的存活 exec 会话，回退容器内枚举发现");
-            discover_container_cwd(&docker, &container_id).await?
+            // 常见于会话早于监听器启动（exec_start 事件在 since 之前，无法补登记）
+            macro_log::d!("[cwd] 跟踪表未命中（会话可能早于监听器启动），容器内枚举发现");
+            discover_container_cwd(&docker, &container_id, client_pid).await?
         }
     };
     macro_log::d!("[cwd] 容器内 cwd: {container_cwd}");
@@ -248,13 +296,17 @@ async fn tracked_container_cwd(
 
 /// 无跟踪会话时的兜底：在容器内枚举"分配了 tty 的交互 shell"（`docker exec -it`
 /// 会为 shell 分配 /dev/pts/N；宿主 dockerd 无法感知其容器内 pid，事件流也可能
-/// 丢投递）。取 pid 数值最大者（最近一次 docker exec 会话）并直接读其 cwd。
-/// 我们的探测 exec 未分配 tty（fd/0 为管道/套接字），不会命中自身。
-async fn discover_container_cwd(docker: &Docker, container_id: &str) -> Option<String> {
+/// 丢投递）。多会话同容器时与登记表同样按客户端启动时间相关：容器内
+/// /proc/<pid>/stat 的 starttime 滴答与宿主同一时钟，换算后取"启动时刻紧随
+/// 本客户端"的 shell。探测 exec 未分配 tty（fd/0 为管道/套接字），不会命中自身。
+async fn discover_container_cwd(docker: &Docker, container_id: &str, client_pid: u32) -> Option<String> {
+    // 输出 "pid starttime_ticks cwd"：starttime 取 stat 第 22 字段（去掉 "pid (comm)" 前缀后第 20 列）
     let script = "for p in /proc/[0-9]*; do \
         t=$(readlink $p/fd/0 2>/dev/null); \
         case $t in /dev/pts/*|/dev/pty*) \
-            c=$(readlink $p/cwd 2>/dev/null) && echo \"${p#/proc/} $c\";; esac; done";
+            c=$(readlink $p/cwd 2>/dev/null) || continue; \
+            st=$(sed 's/.*) //' $p/stat 2>/dev/null | cut -d' ' -f20); \
+            echo \"${p#/proc/} ${st:-0} $c\";; esac; done";
     let out = match tokio::time::timeout(
         Duration::from_secs(5),
         exec_capture(
@@ -275,21 +327,57 @@ async fn discover_container_cwd(docker: &Docker, container_id: &str) -> Option<S
             return None;
         }
     };
-    // 输出行 "pid cwd"（cwd 可能含空格，以首个空格切分）；pid 最大 = 最近会话
-    let latest = out
+    // 行格式 "pid ticks cwd"（cwd 可能含空格，以首个空格二次切分）
+    let client_start = crate::common::unix::proc_start_time(client_pid);
+    let btime = boot_time()?;
+    let shells: Vec<(u32, SystemTime, String)> = out
         .lines()
         .filter_map(|l| {
-            let (pid, cwd) = l.split_once(' ')?;
+            let (pid, rest) = l.split_once(' ')?;
             let pid = pid.parse::<u32>().ok()?;
-            cwd.starts_with('/').then_some((pid, cwd.to_string()))
+            let (ticks, cwd) = rest.split_once(' ')?;
+            let ticks: u64 = ticks.parse().ok()?;
+            let start = SystemTime::UNIX_EPOCH + Duration::from_secs(btime + ticks / 100);
+            cwd.starts_with('/').then_some((pid, start, cwd.to_string()))
         })
-        .max_by_key(|(pid, _)| *pid);
-    let Some((pid, cwd)) = latest else {
+        .collect();
+    let picked = pick_shell(&shells, client_start);
+    let Some((pid, cwd)) = picked else {
         macro_log::d!("[cwd] 容器内未发现分配 tty 的 exec shell");
         return None;
     };
     macro_log::d!("[cwd] 容器内发现 exec shell pid={pid} cwd={cwd}");
     Some(cwd)
+}
+
+/// 容器内 tty shell 候选选择：优先"启动时刻紧随客户端进程启动"（与登记表同一
+/// 相关策略，解决同容器多会话歧义）；客户端启动时间不可得时回退 pid 最大者
+/// （最近一次 exec）。纯函数便于单元测试
+fn pick_shell(
+    shells: &[(u32, SystemTime, String)],
+    client_start: Option<SystemTime>,
+) -> Option<(u32, String)> {
+    match client_start {
+        Some(t) => shells
+            .iter()
+            .filter(|(_, start, _)| *start + Duration::from_secs(1) >= t)
+            .min_by_key(|(_, start, _)| start.duration_since(t).unwrap_or(Duration::ZERO))
+            .map(|(pid, _, cwd)| (*pid, cwd.clone())),
+        None => shells
+            .iter()
+            .max_by_key(|(pid, _, _)| *pid)
+            .map(|(pid, _, cwd)| (*pid, cwd.clone())),
+    }
+}
+
+/// 系统启动时刻（/proc/stat 的 btime；容器内外同一时钟）
+fn boot_time() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    stat.lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// 从 docker 客户端 cmdline 提取容器引用：`docker exec [-flag [value]...] <ctr> <cmd>`。
@@ -362,17 +450,7 @@ async fn container_cwd(docker: &Docker, container_id: &str, pid: u32) -> Option<
 
 /// 容器内一次性 exec 并收集输出（调用方可限时；流 EOF 即进程退出）
 async fn exec_capture(docker: &Docker, container_id: &str, cmd: Vec<String>) -> anyhow::Result<String> {
-    let create = docker
-        .create_exec(
-            container_id,
-            CreateExecOptions {
-                cmd: Some(cmd),
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
-                ..Default::default()
-            },
-        )
-        .await?;
+    let create = create_own_exec(docker, container_id, cmd).await?;
     let started = docker
         .start_exec(
             &create.id,
@@ -403,16 +481,13 @@ pub async fn mkdir_p(container_id: &str, path: &str) -> anyhow::Result<()> {
     tokio::time::timeout(
         Duration::from_secs(10),
         async {
-            let created = docker
-                .create_exec(
-                    container_id,
-                    CreateExecOptions::<String> {
-                        cmd: Some(vec!["mkdir".to_string(), "-p".to_string(), path.to_string()]),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .context("mkdir exec 创建失败")?;
+            let created = create_own_exec(
+                &docker,
+                container_id,
+                vec!["mkdir".to_string(), "-p".to_string(), path.to_string()],
+            )
+            .await
+            .context("mkdir exec 创建失败")?;
             docker
                 .start_exec(&created.id, None)
                 .await
@@ -469,10 +544,10 @@ pub async fn push_file(
     let options = UploadToContainerOptionsBuilder::new().path(dest_dir).build();
     tokio::time::timeout(
         Duration::from_secs(300),
-        docker.upload_to_container_streaming(
+        docker.upload_to_container(
             container_id,
             Some(options),
-            futures::stream::once(async move { bytes::Bytes::from(tar_buf) }),
+            bollard::body_stream(futures::stream::once(async move { bytes::Bytes::from(tar_buf) })),
         ),
     )
     .await
@@ -575,6 +650,37 @@ mod tests {
         let t = crate::common::unix::proc_start_time(std::process::id()).expect("自身启动时刻应可读");
         assert!(t <= SystemTime::now());
         assert_eq!(crate::common::unix::proc_start_time(u32::MAX - 1), None);
+    }
+
+    /// 容器内 tty shell 候选选择：同容器多会话按客户端启动时间相关；
+    /// 客户端时间不可得时回退 pid 最大者
+    #[test]
+    fn pick_shell_correlates_client_start() {
+        let base = SystemTime::now() - Duration::from_secs(120);
+        let s1 = base + Duration::from_secs(10); // 客户端 A 的 shell
+        let s2 = base + Duration::from_secs(50); // 客户端 B 的 shell
+        let shells = vec![
+            (1u32, s1, "/a".to_string()),
+            (2u32, s2, "/b".to_string()),
+        ];
+        // 客户端 A 启动于 9s → 命中 /a；客户端 B 启动于 49s → 命中 /b
+        assert_eq!(
+            pick_shell(&shells, Some(base + Duration::from_secs(9))),
+            Some((1, "/a".to_string()))
+        );
+        assert_eq!(
+            pick_shell(&shells, Some(base + Duration::from_secs(49))),
+            Some((2, "/b".to_string()))
+        );
+        // 早于所有 shell 启动的客户端（异常情况）→ 容差取最近的
+        assert_eq!(
+            pick_shell(&shells, Some(base)),
+            Some((1, "/a".to_string()))
+        );
+        // 无客户端时间 → pid 最大（最近会话）
+        assert_eq!(pick_shell(&shells, None), Some((2, "/b".to_string())));
+        // 无候选
+        assert_eq!(pick_shell(&[], None), None);
     }
 
     /// 容器引用提取：布尔 flag、内联取值、独立取值、镜像命令词均可跳过
