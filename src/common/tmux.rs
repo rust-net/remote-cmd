@@ -213,6 +213,7 @@ mod tests {
     /// 自足集成测试：经 PTY 自建 tmux 会话并 attach，验证 client/pane 查询链
     /// （不依赖测试机是否已有附加的 tmux 客户端）
     #[tokio::test]
+    #[ignore = "依赖本机 tmux"]
     async fn test_query_tmux() {
         use crate::common::pty;
         use std::time::Duration;

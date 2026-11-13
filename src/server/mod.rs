@@ -63,7 +63,7 @@ pub async fn serve(port: u16, password: Option<String>, data_dir: Option<String>
     let audit = store::Audit::new(&dir);
     let state = Arc::new(state::AppState::new(dir.clone(), config.admin_password_hash, store, audit));
 
-    let app = routes::router(state);
+    let app = routes::router(state.clone());
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     macro_log::i!("remote-cmd 服务端监听: {addr}");
@@ -80,6 +80,10 @@ pub async fn serve(port: u16, password: Option<String>, data_dir: Option<String>
             macro_log::i!("注册地址（公网）: https://{ip}:{port}");
         }
     });
+
+    // 容器上传暂存清扫（启动时无进行中的上传，清理上次运行遗留的 uploads/ctr-*）
+    #[cfg(unix)]
+    state.sweep_container_staging();
 
     // docker exec 事件监听（无 docker 环境自动禁用）
     #[cfg(unix)]

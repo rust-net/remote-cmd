@@ -41,6 +41,8 @@ xdialog = "4.1.4"
 bollard = { version = "0.21", default-features = false, features = ["http", "pipe"] }
 # 文件推入容器：upload_to_container 需要 tar 归档流
 tar = "0.4"
+# 自更新解包 Linux 的 tar.gz 资产（默认 feature 为纯 Rust miniz_oxide）
+flate2 = "1"
 bytes = "1"
 
 [target.'cfg(windows)'.dependencies]

@@ -93,6 +93,8 @@ fn rejected(reason: &str) -> Message {
 /// 上传落地目标：宿主目录或容器内目录（docker exec 会话，文件经本地暂存后推入容器）
 enum UploadTarget {
     Host(PathBuf),
+    /// 容器目标仅 Unix 服务端可达（docker 模块仅 unix 编译）
+    #[cfg(unix)]
     Container {
         /// 容器目标（id/ref/容器内 cwd 基准）
         ctr: crate::common::docker::ContainerCwd,
@@ -106,6 +108,7 @@ impl UploadTarget {
     fn local_base(&self) -> &std::path::Path {
         match self {
             UploadTarget::Host(p) => p,
+            #[cfg(unix)]
             UploadTarget::Container { staging, .. } => staging,
         }
     }
@@ -206,14 +209,19 @@ async fn session(
             return;
         }
         // 容器目标与会话钉定一并回放（客户端仅回声路径，容器目标始终以服务端记录为准）
-        match state.container_target(&session_owned) {
-            Some(ctr) => UploadTarget::Container { ctr, staging: PathBuf::from(&init.base_dir) },
-            None => UploadTarget::Host(PathBuf::from(&init.base_dir)),
-        }
+        #[cfg(unix)]
+        let ctr_target = state.container_target(&session_owned).map(|ctr| UploadTarget::Container {
+            ctr,
+            staging: PathBuf::from(&init.base_dir),
+        });
+        #[cfg(not(unix))]
+        let ctr_target: Option<UploadTarget> = None;
+        ctr_target.unwrap_or_else(|| UploadTarget::Host(PathBuf::from(&init.base_dir)))
     } else {
         let t = upload_target(&state, &client.id, session).await;
         // 首次解析：钉定会话基准（客户端后续回传此值才被接受）
         state.set_upload_base(&session_owned, &display_path(t.local_base()));
+        #[cfg(unix)]
         if let UploadTarget::Container { ctr, .. } = &t {
             state.set_container_target(&session_owned, ctr.clone());
         }
@@ -221,6 +229,7 @@ async fn session(
     };
     let base = target.local_base().to_path_buf();
     // 容器会话内 base_dir 对应的实际容器目录（后续 mkdir/推送都以它为基准）
+    #[cfg(unix)]
     let ctr_dir = |ctr: &crate::common::docker::ContainerCwd, rel: &str| {
         crate::common::docker::container_join(&ctr.container_cwd, rel)
     };
@@ -244,6 +253,7 @@ async fn session(
         // 存在性探测：宿主查本地 fs；容器 exec test -d（存在性以容器内为准）
         let existed = match &target {
             UploadTarget::Host(_) => tokio::fs::try_exists(&dir).await.unwrap_or(false),
+            #[cfg(unix)]
             UploadTarget::Container { ctr, .. } => match crate::common::docker::path_exists(&ctr.container_id, &ctr_dir(ctr, &rel), true).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -256,6 +266,7 @@ async fn session(
         if init.probe && existed {
             let path = match &target {
                 UploadTarget::Host(_) => display_path(&dir),
+                #[cfg(unix)]
                 UploadTarget::Container { ctr, .. } => ctr_dir(ctr, &rel),
             };
             let _ = socket
@@ -281,6 +292,7 @@ async fn session(
                 actual_rel = format!("{rel}_{i}");
                 let free = match &target {
                     UploadTarget::Host(_) => !tokio::fs::try_exists(base.join(&actual_rel)).await.unwrap_or(false),
+                    #[cfg(unix)]
                     UploadTarget::Container { ctr, .. } => !crate::common::docker::path_exists(&ctr.container_id, &ctr_dir(ctr, &actual_rel), true).await.unwrap_or(true),
                 };
                 if free {
@@ -295,6 +307,7 @@ async fn session(
                 .await
                 .map(|_| display_path(&mkdir_local))
                 .map_err(|e| e.to_string()),
+            #[cfg(unix)]
             UploadTarget::Container { ctr, .. } => {
                 crate::common::docker::mkdir_p(&ctr.container_id, &ctr_dir(ctr, &actual_rel))
                     .await
@@ -444,9 +457,14 @@ async fn session(
 
     // 容器目标：接收完成后推入容器内目标目录（本地暂存文件用后即删）。
     // 客户端回执为纯容器路径；审计日志保持 ctr:<容器>:<路径> 前缀以便区分容器上传
+    // （非 Unix 无容器分支，以下三个变量保持不变，故允许 unused_mut）
+    #[allow(unused_mut)]
     let mut path = display_path(&dest);
+    #[allow(unused_mut)]
     let mut client_path: Option<String> = None;
+    #[allow(unused_mut)]
     let mut audit_dir = dir.display().to_string();
+    #[cfg(unix)]
     if let UploadTarget::Container { ctr, .. } = &target {
         let dest_dir = ctr_dir(ctr, &rel);
         // 冲突语义：overwrite 直接推（daemon 同名覆盖）；否则容器内 _N 探测重命名

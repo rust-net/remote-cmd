@@ -39,6 +39,7 @@ pub struct AppState {
     /// （上传通道不得成为独立于 shell 的任意写原语）
     pub upload_bases: Mutex<HashMap<String, String>>,
     /// docker exec 会话的容器落地目标（cwd.rs 解析；文件接收完成后推入容器）
+    #[cfg(unix)]
     pub container_targets: Mutex<HashMap<String, crate::common::docker::ContainerCwd>>,
 }
 
@@ -66,6 +67,7 @@ impl AppState {
             pty_pids: Mutex::new(HashMap::new()),
             upload_manifests: Mutex::new(HashMap::new()),
             upload_bases: Mutex::new(HashMap::new()),
+            #[cfg(unix)]
             container_targets: Mutex::new(HashMap::new()),
         }
     }
@@ -144,11 +146,47 @@ impl AppState {
     /// 会话结束时清理上传清单
     pub fn clear_uploads(&self, session_id: &str) {
         self.upload_manifests.lock().unwrap().remove(session_id);
-        self.upload_bases.lock().unwrap().remove(session_id);
-        self.container_targets.lock().unwrap().remove(session_id);
+        let base = self.upload_bases.lock().unwrap().remove(session_id);
+        #[cfg(unix)]
+        {
+            // 容器会话：清理本地暂存根目录（uploads/ctr-<session>-<ts>，上传中断 /
+            // 失败路径的残留一并清除）。基准确为容器暂存目录（父目录名 uploads 且
+            // 以 ctr- 命名）时才删除，宿主会话的落地目录绝不能动
+            let ctr = self.container_targets.lock().unwrap().remove(session_id);
+            if ctr.is_some() {
+                if let Some(base) = base {
+                    let p = std::path::PathBuf::from(&base);
+                    // display_path 已 canonicalize，与 data_dir 拼接比较可能因符号链接
+                    // 失配，故只比对目录名与父目录名
+                    if p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ctr-"))
+                        && p.parent().is_some_and(|q| q.file_name().map_or(false, |n| n == "uploads"))
+                    {
+                        let _ = std::fs::remove_dir_all(p);
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = base;
+    }
+
+    /// 启动时清扫容器上传暂存目录（uploads/ctr-<session>-<ts>）：此时无进行中的
+    /// 上传，上次运行（崩溃/强杀）遗留的暂存可直接删除
+    #[cfg(unix)]
+    pub fn sweep_container_staging(&self) {
+        let Ok(entries) = std::fs::read_dir(self.data_dir.join("uploads")) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("ctr-") {
+                macro_log::d!("[upload] 清理遗留暂存目录: {}", entry.path().display());
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     /// 记录会话的容器落地目标（docker exec 会话；值由服务端解析，客户端不可指定）
+    #[cfg(unix)]
     pub fn set_container_target(&self, session_id: &str, target: crate::common::docker::ContainerCwd) {
         if !session_id.is_empty() {
             self.container_targets
@@ -159,6 +197,7 @@ impl AppState {
     }
 
     /// 读取会话的容器落地目标（None = 非容器会话）
+    #[cfg(unix)]
     pub fn container_target(&self, session_id: &str) -> Option<crate::common::docker::ContainerCwd> {
         self.container_targets.lock().unwrap().get(session_id).cloned()
     }

@@ -15,8 +15,9 @@ pub fn get_cwd(_pid: u32) -> Result<String, std::io::Error> {
     ))
 }
 
-/// 上传落地目标：宿主路径或容器内路径
+/// 上传落地目标：宿主路径或容器内路径（仅 unix 解析链使用）
 #[derive(Debug)]
+#[cfg(unix)]
 pub enum ProcessCwd {
     /// 宿主文件系统路径
     Host(String),

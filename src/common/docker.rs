@@ -14,6 +14,9 @@
 //!
 //! 兜底：事件流可能丢投递（watcher 启动前 / daemon 重启 / 环境异常），无跟踪会话
 //! 时改为在容器内枚举分配了 tty 的 shell（最近一次 docker exec 会话）直接读 cwd。
+//!
+//! 平台：仅 Unix 编译（bollard 依赖只挂 unix target）；调用点（state.rs / upload.rs）
+//! 按 `#[cfg(unix)]` 门控，非 Unix 无容器上传能力。
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -141,21 +144,26 @@ impl ExecTracker {
     }
 }
 
-/// 启动 exec 事件监听后台任务：docker daemon 不可达时静默禁用（无 docker 环境
-/// 是常态）；连接成功后事件流中断（daemon 重启等）自动重连。
+/// 启动 exec 事件监听后台任务：docker daemon 不可达时退避重试（daemon 可能晚于
+/// 本服务启动，如 systemd 并行拉起；上限 5 分钟避免无 docker 环境的空转）。
+/// 连接成功后事件流中断（daemon 重启等）自动重连。
 pub fn spawn_watcher() {
     tokio::spawn(async move {
-        // 首次连不上视为无 docker 环境，放弃（避免无谓轮询）
-        let Some(docker) = connect().await else {
-            macro_log::d!("[docker] docker daemon 不可达，exec 事件监听禁用");
-            return;
-        };
-        let _ = TRACKER.set(ExecTracker::default());
-        macro_log::i!("[docker] 已连接 docker daemon，开始跟踪 exec 会话");
+        let mut backoff = Duration::from_secs(5);
         loop {
-            let err = run_event_loop(&docker).await;
-            macro_log::w!("[docker] 事件流中断: {err}，5s 后重连");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            let Some(docker) = connect().await else {
+                macro_log::d!("[docker] docker daemon 不可达，{}s 后重试", backoff.as_secs());
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(300));
+                continue;
+            };
+            let _ = TRACKER.set(ExecTracker::default());
+            macro_log::i!("[docker] 已连接 docker daemon，开始跟踪 exec 会话");
+            loop {
+                let err = run_event_loop(&docker).await;
+                macro_log::w!("[docker] 事件流中断: {err}，5s 后重连");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
         }
     });
 }
@@ -475,7 +483,8 @@ pub fn container_join(base: &str, rel: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), rel)
 }
 
-/// 容器内递归建目录（mkdir -p；极简镜像缺 mkdir 时报错，调用方拒收）
+/// 容器内递归建目录（mkdir -p）：收集输出并校验 exec 退出码，容器内失败
+/// （权限不足 / 只读 fs / 极简镜像缺 mkdir）显式报错，调用方拒收
 pub async fn mkdir_p(container_id: &str, path: &str) -> anyhow::Result<()> {
     let docker = connect().await.context("docker daemon 不可达")?;
     tokio::time::timeout(
@@ -488,11 +497,29 @@ pub async fn mkdir_p(container_id: &str, path: &str) -> anyhow::Result<()> {
             )
             .await
             .context("mkdir exec 创建失败")?;
-            docker
-                .start_exec(&created.id, None)
+            let started = docker
+                .start_exec(
+                    &created.id,
+                    Some(StartExecOptions { detach: false, ..Default::default() }),
+                )
                 .await
                 .context("mkdir exec 启动失败")?;
-            Ok::<(), anyhow::Error>(())
+            let StartExecResults::Attached { mut output, .. } = started else {
+                anyhow::bail!("mkdir exec 未附加输出流");
+            };
+            let mut out = String::new();
+            while let Some(Ok(chunk)) = output.next().await {
+                out.push_str(&String::from_utf8_lossy(chunk.into_bytes().as_ref()));
+            }
+            // exec 退出码校验：start_exec 对进程非零退出不报错，必须显式检查
+            let inspect = docker
+                .inspect_exec(&created.id)
+                .await
+                .context("mkdir exec 状态查询失败")?;
+            if inspect.exit_code != Some(0) {
+                anyhow::bail!("容器内 mkdir 失败 (exit={:?}): {}", inspect.exit_code, out.trim());
+            }
+            Ok(())
         },
     )
     .await
@@ -562,7 +589,9 @@ mod tests {
 
     /// 容器写入链路端到端（不依赖事件流）：mkdir_p → push_file → 容器内校验内容
     /// → 清理。自建测试容器，不依赖环境既有容器状态
+    // 依赖 docker daemon 与 alpine 镜像，默认跳过：cargo test -- --ignored
     #[tokio::test]
+    #[ignore = "依赖 docker daemon 与 alpine 镜像"]
     async fn test_container_push_file() {
         let docker = connect().await.expect("docker daemon 不可达");
         // 自建测试容器（alpine 镜像本地已有）

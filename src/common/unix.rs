@@ -148,7 +148,9 @@ mod tests {
     use super::*;
     use crate::common::pty;
 
+    // 依赖本机 tmux 与 docker（alpine 镜像），默认跳过：cargo test -- --ignored
     #[tokio::test]
+    #[ignore = "依赖本机 tmux 与 docker"]
     async fn test_find_client_type() {
         let (master, mut child) = pty::run(
             "sh",
@@ -197,6 +199,7 @@ mod tests {
     /// docker 客户端），经事件跟踪的 exec 会话解析容器内实时 cwd。
     /// 依赖本机 docker daemon 与 alpine 镜像；自建测试容器
     #[tokio::test]
+    #[ignore = "依赖本机 tmux、docker daemon 与 alpine 镜像"]
     async fn test_resolve_docker_exec_cwd() {
         use std::time::Duration;
 

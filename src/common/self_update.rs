@@ -15,6 +15,8 @@
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::PathBuf;
+// Windows 专用（注册表代理读取 / self-cleanup 进程），Unix 下编译报未使用
+#[cfg(windows)]
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -298,9 +300,9 @@ fn expected_hash(sums: &str, asset_name: &str) -> Option<String> {
 }
 
 /// 解压 Release 资产中的可执行文件到 dest。
-/// Windows 资产为 zip（zip crate 解包）；Linux 资产为 tar.gz——用系统 tar 命令行
-/// 解压（tar/flate2 crate 偏重，且 Linux 服务器恒预装 tar）。tar 成员名不确定，
-/// 解压到临时目录后按文件名挑选二进制（优先含 remote-cmd，其次最大文件）
+/// Windows 资产为 zip（zip crate 解包）；Linux 资产为 tar.gz——tar + flate2 纯
+/// Rust 解包（两遍扫描：第一遍只读成员头选目标——优先名含 remote-cmd，其次
+/// header 中体积最大者；第二遍解出目标成员并恢复可执行权限）
 fn extract_binary(archive: &PathBuf, dest: &PathBuf) -> Result<()> {
     #[cfg(windows)]
     {
@@ -323,62 +325,53 @@ fn extract_binary(archive: &PathBuf, dest: &PathBuf) -> Result<()> {
     }
     #[cfg(not(windows))]
     {
-        let tmp = tempfile::Builder::new()
-            .prefix("remote-cmd-extract-")
-            .tempdir()
-            .context("创建解压临时目录失败")?;
-        let out = Command::new("tar")
-            .arg("-xzf")
-            .arg(archive)
-            .arg("-C")
-            .arg(tmp.path())
-            .output()
-            .context("执行 tar 解压失败（Linux 需预装 tar 命令）")?;
-        if !out.status.success() {
-            bail!("tar 解压失败: {}", String::from_utf8_lossy(&out.stderr).trim());
+        /// 扫描 tar.gz 成员头，挑出目标二进制成员名（第一遍，只读头不读数据体）
+        fn pick_member(path: &PathBuf) -> Option<String> {
+            let f = File::open(path).ok()?;
+            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+            let mut named: Option<(String, u64)> = None;
+            let mut largest: Option<(String, u64)> = None;
+            for entry in ar.entries().ok()? {
+                let mut entry = entry.ok()?;
+                if !entry.header().entry_type().is_file() {
+                    continue;
+                }
+                let name = entry.path().ok()?.to_string_lossy().into_owned();
+                let size = entry.header().size().unwrap_or(0);
+                if named.is_none() && name.contains("remote-cmd") {
+                    named = Some((name.clone(), size));
+                }
+                if largest.as_ref().is_none_or(|(_, s)| size > *s) {
+                    largest = Some((name, size));
+                }
+                // 跳过数据体：Entry 实现了 Read，copy 到 sink 消费掉（无 skip 方法）
+                std::io::copy(&mut entry, &mut std::io::sink()).ok()?;
+            }
+            named.or(largest).map(|(name, _)| name)
         }
-        let mut files = Vec::new();
-        collect_files(tmp.path(), &mut files, 0);
-        let bin = files
-            .iter()
-            .find(|p| {
-                p.file_name()
-                    .map(|s| s.to_string_lossy().contains("remote-cmd"))
-                    .unwrap_or(false)
-            })
-            .or_else(|| {
-                // 无命名约定文件时取最大文件（二进制体积远大于附带的 README 等）
-                files
-                    .iter()
-                    .max_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-            })
-            .ok_or_else(|| anyhow!("压缩包内未找到可执行文件"))?;
-        fs::copy(bin, dest).context("写入新二进制失败")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
-        }
-        Ok(())
-    }
-}
 
-/// 递归收集目录下文件（限深 4 层，防异常嵌套压缩包）
-#[cfg(not(windows))]
-fn collect_files(dir: &std::path::Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 4 {
-        return;
-    }
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect_files(&p, out, depth + 1);
-        } else {
-            out.push(p);
+        let Some(member) = pick_member(archive) else {
+            bail!("压缩包内未找到可执行文件");
+        };
+        // 第二遍：解出目标成员
+        let f = File::open(archive)?;
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+        for entry in ar.entries().context("读取 tar.gz 失败")? {
+            let mut entry = entry.context("读取 tar 成员失败")?;
+            if entry.path().context("读取成员名失败")?.to_string_lossy() != member {
+                std::io::copy(&mut entry, &mut std::io::sink()).context("跳过 tar 成员失败")?;
+                continue;
+            }
+            let mut out = File::create(dest).context("写入新二进制失败")?;
+            std::io::copy(&mut entry, &mut out).context("解出二进制失败")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
+            }
+            return Ok(());
         }
+        bail!("压缩包内未找到成员 {member}")
     }
 }
 
@@ -493,6 +486,41 @@ pub fn self_cleanup(paths: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// extract_binary（tar + flate2 纯 Rust 解包）：tar.gz 中优先挑名含
+    /// remote-cmd 的成员，解出内容并保留 0755 权限
+    #[cfg(unix)]
+    #[test]
+    fn extract_binary_picks_named_member() {
+        let dir = std::env::temp_dir().join(format!("rc-extract-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("asset.tar.gz");
+        let f = File::create(&archive).unwrap();
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        {
+            let mut b = tar::Builder::new(enc);
+            for (name, data) in [
+                ("README.md", b"readme".as_slice()),
+                ("remote-cmd-x86_64-unknown-linux-musl", b"BINARY-CONTENT".as_slice()),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o755);
+                h.set_cksum();
+                b.append_data(&mut h, name, data).unwrap();
+            }
+            b.into_inner().unwrap().finish().unwrap();
+        }
+        let dest = dir.join("out.bin");
+        extract_binary(&archive, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"BINARY-CONTENT");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// SHA256SUMS 按资产名匹配：命中本平台项、忽略其它平台、未知资产返回 None
     #[test]
