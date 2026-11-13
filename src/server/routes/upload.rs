@@ -90,22 +90,64 @@ fn rejected(reason: &str) -> Message {
     Message::Text(serde_json::json!({ "type": "rejected", "reason": reason }).to_string().into())
 }
 
-/// 上传落地目录：Unix 经 cwd 解析链取所传 exec 会话（shell）进程的 cwd
-/// （tmux 感知：tmux 内 cd 后取活动 pane 实时 cwd，见 common/cwd.rs；拖放上传语义
-/// = 文件落在 shell 当前工作目录）；会话 id 缺失/未知/归属客户端不符、解析失败
-/// 或 Windows 服务端 → 默认 uploads 目录
-async fn upload_dir(state: &AppState, client_id: &str, session: Option<&str>) -> PathBuf {
+/// 上传落地目标：宿主目录或容器内目录（docker exec 会话，文件经本地暂存后推入容器）
+enum UploadTarget {
+    Host(PathBuf),
+    Container {
+        /// 容器目标（id/ref/容器内 cwd 基准）
+        ctr: crate::common::docker::ContainerCwd,
+        /// 本地暂存根目录：接收帧先落盘，完成后推入容器（复用既有接收/续传/重命名逻辑）
+        staging: PathBuf,
+    },
+}
+
+impl UploadTarget {
+    /// 本地暂存/落盘根目录（容器目标即 staging）
+    fn local_base(&self) -> &std::path::Path {
+        match self {
+            UploadTarget::Host(p) => p,
+            UploadTarget::Container { staging, .. } => staging,
+        }
+    }
+}
+
+/// 上传落地目标解析：Unix 经 cwd 解析链取所传 exec 会话（shell）进程的 cwd
+/// （tmux 感知：tmux 内 cd 后取活动 pane 实时 cwd，见 common/cwd.rs；docker exec
+/// 会话直接写容器内，见 common/docker.rs；拖放上传语义 = 文件落在 shell 当前工作
+/// 目录）；会话 id 缺失/未知/归属客户端不符、解析失败或 Windows 服务端 → 默认
+/// uploads 目录
+async fn upload_target(state: &AppState, client_id: &str, session: Option<&str>) -> UploadTarget {
+    let default = || UploadTarget::Host(state.data_dir.join("uploads"));
     let pid = session.and_then(|s| state.pty_pid(s, client_id));
     let Some(pid) = pid else {
         macro_log::d!("[upload] 回退默认目录: session={session:?} 无已登记 pid（会话未登记/已结束/客户端未回传 session）");
-        return state.data_dir.join("uploads");
+        return default();
     };
-    if let Some(cwd) = crate::common::cwd::resolve_process_cwd(pid).await {
-        macro_log::d!("[upload] 落地进程 cwd: pid={pid} dir={cwd}");
-        return PathBuf::from(cwd);
+    #[cfg(unix)]
+    if let Some(target) = crate::common::cwd::resolve_process_cwd(pid).await {
+        return match target {
+            crate::common::cwd::ProcessCwd::Host(dir) => UploadTarget::Host(PathBuf::from(dir)),
+            crate::common::cwd::ProcessCwd::Container(ctr) => {
+                // 容器会话：本地暂存目录按会话唯一，接收完成后逐文件推入容器
+                let staging = state.data_dir.join("uploads").join(format!(
+                    "ctr-{}-{}",
+                    session.unwrap_or_default(),
+                    chrono::Utc::now().timestamp_millis()
+                ));
+                macro_log::d!(
+                    "[upload] 容器落地目标: ctr={} cwd={} 暂存={}",
+                    ctr.container_ref,
+                    ctr.container_cwd,
+                    staging.display()
+                );
+                UploadTarget::Container { ctr, staging }
+            }
+        };
     }
+    #[cfg(not(unix))]
+    let _ = pid;
     macro_log::d!("[upload] 回退默认目录: pid={pid} cwd 解析链失败（见 [cwd] 日志）");
-    state.data_dir.join("uploads")
+    default()
 }
 
 async fn session(
@@ -138,12 +180,13 @@ async fn session(
         return;
     };
 
-    // 落地基准目录：base_dir 只能是服务端首次解析并钉定的值（会话内严格相等校验，
-    // 客户端仅可回声、不可伪造任意绝对路径——上传通道不得成为独立于 shell 的任意写原语）；
-    // 未携带 base_dir 时逐请求解析（Unix 优先会话 shell cwd / tmux 感知，Windows → uploads）
+    // 落地基准：base_dir 只能是服务端首次解析并钉定的值（会话内严格相等校验，
+    // 客户端仅可回声、不可伪造任意绝对路径——上传通道不得成为独立于 shell 的任意
+    // 写原语）；未携带 base_dir 时逐请求解析（Unix 优先会话 shell cwd / tmux 感知 /
+    // docker exec 容器内 cwd，Windows → uploads）
     let session_owned = init.session.clone();
     let session = (!session_owned.is_empty()).then_some(session_owned.as_str());
-    let base = if !init.base_dir.is_empty() {
+    let target = if !init.base_dir.is_empty() {
         let pinned = session.and_then(|s| state.upload_base(s));
         let valid = pinned.as_deref() == Some(init.base_dir.as_str())
             && (PathBuf::from(&init.base_dir).is_absolute() || init.base_dir.starts_with('/'));
@@ -162,12 +205,24 @@ async fn session(
             let _ = socket.close().await;
             return;
         }
-        PathBuf::from(&init.base_dir)
+        // 容器目标与会话钉定一并回放（客户端仅回声路径，容器目标始终以服务端记录为准）
+        match state.container_target(&session_owned) {
+            Some(ctr) => UploadTarget::Container { ctr, staging: PathBuf::from(&init.base_dir) },
+            None => UploadTarget::Host(PathBuf::from(&init.base_dir)),
+        }
     } else {
-        let b = upload_dir(&state, &client.id, session).await;
+        let t = upload_target(&state, &client.id, session).await;
         // 首次解析：钉定会话基准（客户端后续回传此值才被接受）
-        state.set_upload_base(&session_owned, &display_path(&b));
-        b
+        state.set_upload_base(&session_owned, &display_path(t.local_base()));
+        if let UploadTarget::Container { ctr, .. } = &t {
+            state.set_container_target(&session_owned, ctr.clone());
+        }
+        t
+    };
+    let base = target.local_base().to_path_buf();
+    // 容器会话内 base_dir 对应的实际容器目录（后续 mkdir/推送都以它为基准）
+    let ctr_dir = |ctr: &crate::common::docker::ContainerCwd, rel: &str| {
+        crate::common::docker::container_join(&ctr.container_cwd, rel)
     };
     let dir = if rel.is_empty() {
         base.clone()
@@ -186,14 +241,28 @@ async fn session(
             let _ = socket.close().await;
             return;
         }
-        let existed = tokio::fs::try_exists(&dir).await.unwrap_or(false);
+        // 存在性探测：宿主查本地 fs；容器 exec test -d（存在性以容器内为准）
+        let existed = match &target {
+            UploadTarget::Host(_) => tokio::fs::try_exists(&dir).await.unwrap_or(false),
+            UploadTarget::Container { ctr, .. } => match crate::common::docker::path_exists(&ctr.container_id, &ctr_dir(ctr, &rel), true).await {
+                Ok(v) => v,
+                Err(e) => {
+                    macro_log::w!("[upload] 容器目录探测失败（视为不存在继续）: {e}");
+                    false
+                }
+            },
+        };
         // probe 模式：已存在则仅应答不创建（客户端据此决定覆盖合并或重命名）
         if init.probe && existed {
+            let path = match &target {
+                UploadTarget::Host(_) => display_path(&dir),
+                UploadTarget::Container { ctr, .. } => format!("ctr:{}:{}", ctr.container_ref, ctr_dir(ctr, &rel)),
+            };
             let _ = socket
                 .send(Message::Text(
                     serde_json::json!({
                         "type": "dir_exists",
-                        "path": display_path(&dir),
+                        "path": path,
                         "base": base_display,
                     })
                     .to_string()
@@ -210,21 +279,37 @@ async fn session(
             let mut i = 1u32;
             loop {
                 actual_rel = format!("{rel}_{i}");
-                if !tokio::fs::try_exists(base.join(&actual_rel)).await.unwrap_or(false) {
+                let free = match &target {
+                    UploadTarget::Host(_) => !tokio::fs::try_exists(base.join(&actual_rel)).await.unwrap_or(false),
+                    UploadTarget::Container { ctr, .. } => !crate::common::docker::path_exists(&ctr.container_id, &ctr_dir(ctr, &actual_rel), true).await.unwrap_or(true),
+                };
+                if free {
                     break;
                 }
                 i += 1;
             }
         }
-        let target = if actual_rel == rel { dir.clone() } else { base.join(&actual_rel) };
-        match tokio::fs::create_dir_all(&target).await {
-            Ok(_) => {
-                macro_log::d!("[upload] 目录就绪 {} (from {} {})", target.display(), hostname, addr.ip());
+        let mkdir_local = if actual_rel == rel { dir.clone() } else { base.join(&actual_rel) };
+        let result = match &target {
+            UploadTarget::Host(_) => tokio::fs::create_dir_all(&mkdir_local)
+                .await
+                .map(|_| display_path(&mkdir_local))
+                .map_err(|e| e.to_string()),
+            UploadTarget::Container { ctr, .. } => {
+                crate::common::docker::mkdir_p(&ctr.container_id, &ctr_dir(ctr, &actual_rel))
+                    .await
+                    .map(|_| format!("ctr:{}:{}", ctr.container_ref, ctr_dir(ctr, &actual_rel)))
+                    .map_err(|e| e.to_string())
+            }
+        };
+        match result {
+            Ok(path) => {
+                macro_log::d!("[upload] 目录就绪 {path} (from {} {})", hostname, addr.ip());
                 let _ = socket
                     .send(Message::Text(
                         serde_json::json!({
                             "type": "mkdir_ok",
-                            "path": display_path(&target),
+                            "path": path,
                             "name": actual_rel,
                             "existed": existed,
                             "base": base_display,
@@ -236,7 +321,7 @@ async fn session(
                 let _ = socket.close().await;
             }
             Err(e) => {
-                macro_log::w!("[upload] 创建目录失败 {}: {e}", target.display());
+                macro_log::w!("[upload] 创建目录失败: {e}");
                 let _ = socket.send(rejected("服务端目录创建失败")).await;
                 let _ = socket.close().await;
             }
@@ -357,12 +442,64 @@ async fn session(
         return;
     }
 
-    let path = display_path(&dest);
+    // 容器目标：接收完成后推入容器内目标目录（本地暂存文件用后即删）
+    let mut path = display_path(&dest);
+    let mut audit_dir = dir.display().to_string();
+    if let UploadTarget::Container { ctr, .. } = &target {
+        let dest_dir = ctr_dir(ctr, &rel);
+        // 冲突语义：overwrite 直接推（daemon 同名覆盖）；否则容器内 _N 探测重命名
+        let mut dest_name = name.clone();
+        if !init.overwrite {
+            let (stem, ext) = match name.rsplit_once('.') {
+                Some((s, e)) if !s.is_empty() => (&name[..s.len()], &name[s.len()..]),
+                _ => (name.as_str(), ""),
+            };
+            let mut i = 1u32;
+            loop {
+                let probe = crate::common::docker::container_join(&dest_dir, &dest_name);
+                match crate::common::docker::path_exists(&ctr.container_id, &probe, false).await {
+                    Ok(false) => break,
+                    Ok(true) => {
+                        dest_name = format!("{stem}_{i}{ext}");
+                        i += 1;
+                    }
+                    Err(e) => {
+                        macro_log::w!("[upload] 容器内重名探测失败: {e}");
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        let _ = socket.send(rejected("容器状态探测失败")).await;
+                        let _ = socket.close().await;
+                        return;
+                    }
+                }
+            }
+        }
+        match crate::common::docker::push_file(&ctr.container_id, &dest_dir, &dest_name, &dest).await {
+            Ok(_) => {
+                path = format!(
+                    "ctr:{}:{}",
+                    ctr.container_ref,
+                    crate::common::docker::container_join(&dest_dir, &dest_name)
+                );
+                audit_dir = dest_dir;
+                // 清理本地暂存（目录非空时保留）
+                let _ = tokio::fs::remove_file(&dest).await;
+                let _ = tokio::fs::remove_dir(&dir).await;
+            }
+            Err(e) => {
+                macro_log::w!("[upload] 容器推送失败 {}: {e}", dest.display());
+                let _ = tokio::fs::remove_file(&dest).await;
+                let _ = socket.send(rejected("容器写入失败")).await;
+                let _ = socket.close().await;
+                return;
+            }
+        }
+    }
+
     state.upload_mark(&session_owned, &manifest_key);
     state.audit.log(
         "file.upload",
         &hostname,
-        Some(serde_json::json!({ "name": name, "bytes": total, "path": path, "dir": dir.display().to_string(), "ip": addr.ip().to_string() })),
+        Some(serde_json::json!({ "name": name, "bytes": total, "path": path, "dir": audit_dir, "ip": addr.ip().to_string() })),
     );
     let _ = socket
         .send(Message::Text(

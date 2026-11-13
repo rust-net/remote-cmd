@@ -81,6 +81,10 @@ pub async fn serve(port: u16, password: Option<String>, data_dir: Option<String>
         }
     });
 
+    // docker exec 事件监听（无 docker 环境自动禁用）
+    #[cfg(unix)]
+    crate::common::docker::spawn_watcher();
+
     axum_server::bind_rustls(addr, tls_config)
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;

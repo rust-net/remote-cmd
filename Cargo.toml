@@ -36,5 +36,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 tower-http = { version = "0.6", features = ["trace"] }
 xdialog = "4.1.4"
 
+[target.'cfg(unix)'.dependencies]
+# http：Unix socket/TCP 传输（默认 feature，禁用 default 时必须显式声明）；pipe：Windows 命名管道
+bollard = { version = "0.21", default-features = false, features = ["http", "pipe"] }
+# 文件推入容器：upload_to_container 需要 tar 归档流
+tar = "0.4"
+bytes = "1"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Globalization", "Win32_Foundation", "Win32_System_Com", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }

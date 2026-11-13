@@ -38,6 +38,8 @@ pub struct AppState {
     /// 后续 init 的 base_dir 必须与之严格相等，防客户端伪造任意绝对路径写入
     /// （上传通道不得成为独立于 shell 的任意写原语）
     pub upload_bases: Mutex<HashMap<String, String>>,
+    /// docker exec 会话的容器落地目标（cwd.rs 解析；文件接收完成后推入容器）
+    pub container_targets: Mutex<HashMap<String, crate::common::docker::ContainerCwd>>,
 }
 
 /// 会话 pid 登记项
@@ -64,6 +66,7 @@ impl AppState {
             pty_pids: Mutex::new(HashMap::new()),
             upload_manifests: Mutex::new(HashMap::new()),
             upload_bases: Mutex::new(HashMap::new()),
+            container_targets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -142,6 +145,22 @@ impl AppState {
     pub fn clear_uploads(&self, session_id: &str) {
         self.upload_manifests.lock().unwrap().remove(session_id);
         self.upload_bases.lock().unwrap().remove(session_id);
+        self.container_targets.lock().unwrap().remove(session_id);
+    }
+
+    /// 记录会话的容器落地目标（docker exec 会话；值由服务端解析，客户端不可指定）
+    pub fn set_container_target(&self, session_id: &str, target: crate::common::docker::ContainerCwd) {
+        if !session_id.is_empty() {
+            self.container_targets
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), target);
+        }
+    }
+
+    /// 读取会话的容器落地目标（None = 非容器会话）
+    pub fn container_target(&self, session_id: &str) -> Option<crate::common::docker::ContainerCwd> {
+        self.container_targets.lock().unwrap().get(session_id).cloned()
     }
 
     /// 记录/刷新会话钉定的上传基准目录：每次**无 base_dir** 的服务端解析都会覆盖刷新

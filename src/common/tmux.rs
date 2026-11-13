@@ -210,21 +210,40 @@ pub async fn query_tmux_clients(socket: Option<&str>) -> Vec<TmuxClient> {
 mod tests {
     use super::*;
 
+    /// 自足集成测试：经 PTY 自建 tmux 会话并 attach，验证 client/pane 查询链
+    /// （不依赖测试机是否已有附加的 tmux 客户端）
     #[tokio::test]
     async fn test_query_tmux() {
-        let socket = None;
-        let clients = query_tmux_clients(socket).await;
-        assert!(clients.len() > 0, "本机 tmux 无附加客户端，无法构造查询目标");
-        let target = Some(clients.last().unwrap().window_target());
-        let pane = query_tmux_pane(socket, target).await;
-        dbg!(&clients);
-        dbg!(&pane);
-        assert!(clients.len() > 0);
+        use crate::common::pty;
+        use std::time::Duration;
+
+        let (mut master, mut child) = pty::run(
+            "sh",
+            &[
+                "-c",
+                "tmux kill-session -t demo2 2>/dev/null; tmux new -d -s demo2 && tmux attach -t demo2",
+            ],
+            None,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await; // 等待 attach 完成
+
+        let clients = query_tmux_clients(None).await;
+        let tty = master.tty_name().unwrap().to_string_lossy().to_string();
+        let client = clients
+            .iter()
+            .find(|c| c.client_tty == tty)
+            .expect("PTY 内 attach 的客户端未出现在 list-clients 中");
+
+        let target = Some(client.window_target());
+        let pane = query_tmux_pane(None, target).await;
         assert!(pane.is_some());
-        let pane1 = clients.last().unwrap().get_active_pane().await;
-        dbg!(&pane1);
+        let pane1 = client.get_active_pane().await;
         assert!(pane1.is_some());
         assert_eq!(pane1, pane);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

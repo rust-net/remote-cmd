@@ -22,10 +22,9 @@ pub async fn find_client_type(shell_pid: u32) -> ClientType {
         Some(tmux) => ClientType::TmuxClient(tmux.to_owned()),
         None => {
             let processes = enumerate_processes(Some(tty.to_owned()));
-            let Some(process) = processes.iter().find(|p| p.ppid == shell_pid && p.tty == tty) else {
+            let Some(process) = processes.iter().find(|p| p.ppid == shell_pid) else {
                 return ClientType::Unknown;
             };
-            dbg!(&process);
             if process.comm == "docker" {
                 return ClientType::DockerClient(process.clone());
             }
@@ -172,19 +171,81 @@ mod tests {
         }
     }
 
+    /// docker exec cwd 解析端到端：tmux pane 内启动 `docker exec`（pane 前台为
+    /// docker 客户端），经事件跟踪的 exec 会话解析容器内实时 cwd。
+    /// 依赖本机 docker daemon 与 alpine 镜像；自建测试容器
+    #[tokio::test]
+    async fn test_resolve_docker_exec_cwd() {
+        use std::time::Duration;
+
+        // 启动 exec 事件监听（OnceLock 全局共享，重复调用幂等），等待连接建立
+        crate::common::docker::spawn_watcher();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // 自建测试容器，不依赖环境既有容器状态
+        std::process::Command::new("docker")
+            .args(["rm", "-f", "rc-it-exec"])
+            .status()
+            .expect("docker CLI 不可用");
+        std::process::Command::new("docker")
+            .args(["run", "-d", "--name", "rc-it-exec", "alpine", "sleep", "600"])
+            .status()
+            .expect("docker run 失败");
+
+        let (master, mut child) = pty::run(
+            "sh",
+            &[
+                "-c",
+                // pane 内 cd /tmp 后 docker exec 进容器并 cd /etc
+                "tmux kill-session -t demo3 2>/dev/null; tmux new -d -s demo3 && tmux send-keys -t demo3 'cd /tmp && docker exec -it rc-it-exec sh -c \"cd /etc && exec sh\"' Enter && tmux attach -t demo3",
+            ],
+            None,
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await; // 等待 attach 与 exec 会话建立
+
+        let tty = master.tty_name().unwrap().to_string_lossy().to_string();
+        let ClientType::TmuxClient(tmux) = find_client_type(child.process_id().unwrap()).await
+        else {
+            panic!("外层 shell 未识别为 tmux 客户端");
+        };
+        assert_eq!(tty, tmux.client_tty);
+        let pane = tmux.get_active_pane().await.unwrap();
+        assert_eq!(pane.pane_current_command, "docker");
+
+        // pane 前台为 docker 客户端 → DockerClient 分支 → 容器 cwd 解析
+        let ClientType::DockerClient(info) = find_client_type(pane.pane_pid).await else {
+            panic!("pane 前台未识别为 docker 客户端");
+        };
+        let cwd = crate::common::docker::resolve_container_cwd(&info)
+            .await
+            .expect("容器 cwd 解析失败");
+        assert_eq!(cwd.container_cwd, "/etc");
+        // 容器引用与 ID 均已解析（文件将直接推入容器）
+        assert_eq!(cwd.container_ref, "rc-it-exec");
+        assert!(cwd.container_id.len() >= 12);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::process::Command::new("docker")
+            .args(["rm", "-f", "rc-it-exec"])
+            .status()
+            .expect("docker rm 失败");
+    }
+
     #[test]
     fn test_proc_stdin_tty() {
-        // 当前进程 stdin 控制终端路径
-        let pid = std::process::id();
-        let tty1 = proc_stdin_tty(Some(pid));
-        let tty2 = proc_stdin_tty(None);
-        dbg!(&tty1, &tty2);
-        assert_eq!(tty1, tty2);
-        assert!(tty1.is_some());
+        // 测试进程自身的 stdin 未必是终端（cargo test 下常为管道），用 PTY 造真实控制终端
+        let (master, mut child) = pty::run("sleep", &["2"], None).unwrap();
+        let pid = child.process_id().unwrap();
+        let tty = proc_stdin_tty(Some(pid)).unwrap();
+        assert_eq!(master.tty_name().unwrap().to_string_lossy(), tty);
         // init 进程没有 stdin 控制终端路径
         let tty = proc_stdin_tty(Some(1));
         dbg!(&tty);
         assert!(tty.is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

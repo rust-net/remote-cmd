@@ -10,6 +10,8 @@ pub mod self_update;
 
 #[cfg(unix)]
 pub mod unix;
+#[cfg(unix)]
+pub mod docker;
 
 use std::io;
 use thiserror::Error;

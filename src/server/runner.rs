@@ -483,11 +483,11 @@ async fn run_pty(
     };
     let _ = pid_tx.send(child.process_id());
     drop(pair.slave); // 父进程立即释放 slave 端
-    macro_log::d!(
-        "[pty] 服务端会话已启动 {} size={:?} 初次握手查询将由兜底应答",
-        req.program,
-        tty_size
-    );
+    // macro_log::d!(
+    //     "[pty] 服务端会话已启动 {} size={:?} 初次握手查询将由兜底应答",
+    //     req.program,
+    //     tty_size
+    // );
 
     let reader = match pair.master.try_clone_reader() {
         Ok(r) => r,
@@ -543,11 +543,11 @@ async fn run_pty(
             };
             match msg {
                 StdinMsg::Data(data) => {
-                    macro_log::d!(
-                        "[pty-stdin] 服务端向 PTY 写入 {} 字节: {}",
-                        data.len(),
-                        crate::common::escape_bytes(&data)
-                    );
+                    // macro_log::d!(
+                    //     "[pty-stdin] 服务端向 PTY 写入 {} 字节: {}",
+                    //     data.len(),
+                    //     crate::common::escape_bytes(&data)
+                    // );
                     // 背压：写线程消费不动时让出重试（try_send 失败归还数据）
                     let mut data = data;
                     let delivered = loop {
