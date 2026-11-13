@@ -1,3 +1,5 @@
+use std::time::{Duration, SystemTime};
+
 use crate::common::cwd::get_cwd;
 use crate::common::tmux;
 
@@ -39,6 +41,23 @@ pub fn proc_cmdline(pid: u32) -> Option<String> {
         .ok()
         .map(|data| String::from_utf8_lossy(&data).replace('\0', " ").trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 进程启动时刻（/proc/<pid>/stat 第 22 字段为时钟滴答数，自系统启动起算，
+/// 加 /proc/stat 的 btime 得绝对时间；用于跨进程时间相关，不可读返回 None）。
+/// Linux 用户态时钟频率取常规值 100Hz
+pub fn proc_start_time(pid: u32) -> Option<SystemTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.rsplit(')').next()?;
+    let ticks: u64 = rest.split_whitespace().nth(19)?.parse().ok()?;
+    let btime = std::fs::read_to_string("/proc/stat").ok()?;
+    let btime: u64 = btime
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(btime + ticks / 100))
 }
 
 /// 获取进程 stdin 控制终端路径（/dev/pts/N、/dev/tty、/dev/pty）
@@ -220,7 +239,7 @@ mod tests {
         let ClientType::DockerClient(info) = find_client_type(pane.pane_pid).await else {
             panic!("pane 前台未识别为 docker 客户端");
         };
-        let cwd = crate::common::docker::resolve_container_cwd(&info.cmdline)
+        let cwd = crate::common::docker::resolve_container_cwd(&info.cmdline, info.pid)
             .await
             .expect("容器 cwd 解析失败");
         assert_eq!(cwd.container_cwd, "/etc");

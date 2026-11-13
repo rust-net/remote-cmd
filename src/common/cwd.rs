@@ -51,7 +51,7 @@ pub async fn resolve_process_cwd(pid: u32) -> Option<ProcessCwd> {
                     _ => None,
                 };
                 let resolved = match docker_info {
-                    Some(info) => crate::common::docker::resolve_container_cwd(&info.cmdline).await,
+                    Some(info) => crate::common::docker::resolve_container_cwd(&info.cmdline, info.pid).await,
                     None => None,
                 };
                 if let Some(cwd) = resolved {
@@ -69,7 +69,7 @@ pub async fn resolve_process_cwd(pid: u32) -> Option<ProcessCwd> {
             }
             Some(ProcessCwd::Host(pane.pane_current_path))
         }
-        ClientType::DockerClient(info) => match crate::common::docker::resolve_container_cwd(&info.cmdline).await {
+        ClientType::DockerClient(info) => match crate::common::docker::resolve_container_cwd(&info.cmdline, info.pid).await {
             Some(cwd) => {
                 macro_log::d!(
                     "[cwd] docker exec 容器 {} 内 cwd {}",

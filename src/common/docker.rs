@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
@@ -47,33 +47,57 @@ struct ExecTracker {
 }
 
 struct ExecSession {
-    container_id: String,
-    started_at: Instant,
+    /// 容器标识（事件 attributes 只带容器名；个别版本为完整 ID）
+    container: String,
+    /// 会话登记时刻（事件时间）：用于与 docker 客户端进程启动时间相关，
+    /// 区分同容器的多个 exec 会话
+    started_at: SystemTime,
 }
 
 /// exec 会话过期时间：正常交互会话远短于此；兜底防泄漏
 const SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
 
 impl ExecTracker {
-    fn insert(&self, exec_id: String, container_id: String) {
+    fn insert(&self, exec_id: String, container: String, started_at: SystemTime) {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.retain(|_, s| s.started_at.elapsed() < SESSION_TTL);
-        sessions.insert(exec_id, ExecSession { container_id, started_at: Instant::now() });
+        let now = SystemTime::now();
+        // TTL 兜底清理；事件时间略超前于本机时钟（时钟偏差）时保留，不能误删
+        sessions.retain(|_, s| {
+            now.duration_since(s.started_at).map(|d| d < SESSION_TTL).unwrap_or(true)
+        });
+        sessions.insert(exec_id, ExecSession { container, started_at });
     }
 
     fn remove(&self, exec_id: &str) {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(exec_id);
     }
 
-    /// 指定容器上最近创建的 exec 会话 id（按容器名或完整 ID 任一匹配：
-    /// 事件 attributes 只带容器名，查询侧两者都有）
-    fn latest_of(&self, containers: &[&str]) -> Option<String> {
+    /// 指定容器上与本客户端关联的 exec 会话 id（按容器名或完整 ID 任一匹配：
+    /// 事件 attributes 只带容器名，查询侧两者都有）。
+    /// 同容器多会话时按 docker 客户端进程启动时间相关：exec_start 事件紧随
+    /// 客户端启动（1s 容差），登记时间与之最接近者即本客户端的会话；
+    /// 客户端启动时间未知时回退取最近登记的会话。
+    fn latest_of(&self, containers: &[&str], client_start: Option<SystemTime>) -> Option<String> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions
+        let candidates: Vec<(&String, &ExecSession)> = sessions
             .iter()
-            .filter(|(_, s)| containers.iter().any(|c| *c == s.container_id))
-            .max_by_key(|(_, s)| s.started_at)
-            .map(|(id, _)| id.clone())
+            .filter(|(_, s)| containers.iter().any(|c| *c == s.container))
+            .filter(|(_, s)| match client_start {
+                // 事件不可能早于客户端进程启动（容差吸收时钟粒度）
+                Some(t) => s.started_at + Duration::from_secs(1) >= t,
+                None => true,
+            })
+            .collect();
+        match client_start {
+            Some(t) => candidates
+                .into_iter()
+                .min_by_key(|(_, s)| s.started_at.duration_since(t).unwrap_or(Duration::ZERO))
+                .map(|(id, _)| id.clone()),
+            None => candidates
+                .into_iter()
+                .max_by_key(|(_, s)| s.started_at)
+                .map(|(id, _)| id.clone()),
+        }
     }
 }
 
@@ -148,17 +172,22 @@ fn handle_event(msg: EventMessage) {
         return;
     }
     if action.starts_with("exec_start") {
-        tracker.insert(exec_id, container);
+        let started_at = msg
+            .time
+            .and_then(|t| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(t as u64)))
+            .unwrap_or_else(SystemTime::now);
+        tracker.insert(exec_id, container, started_at);
     } else if action.starts_with("exec_die") {
         tracker.remove(&exec_id);
     }
 }
 
 /// docker exec 场景的 cwd 解析入口（cwd.rs resolve_process_cwd 调用）。
-/// `cmdline` 为 docker 客户端进程完整命令行（从中提取容器引用）。
+/// `cmdline` 为 docker 客户端进程完整命令行（从中提取容器引用）；`client_pid`
+/// 为该客户端进程 pid（用于多会话同容器时按启动时间关联 exec 会话）。
 /// 优先用事件跟踪的 exec 会话精确定位；无跟踪会话（事件流中断 / watcher 刚启动 /
 /// daemon 重启）时回退容器内枚举发现。整体失败返回 None，调用方回退宿主 shell cwd。
-pub async fn resolve_container_cwd(cmdline: &str) -> Option<ContainerCwd> {
+pub async fn resolve_container_cwd(cmdline: &str, client_pid: u32) -> Option<ContainerCwd> {
     let Some(container_ref) = container_ref_from_cmdline(cmdline) else {
         macro_log::d!("[cwd] docker 客户端 cmdline 未识别容器引用: {cmdline:?}");
         return None;
@@ -175,7 +204,7 @@ pub async fn resolve_container_cwd(cmdline: &str) -> Option<ContainerCwd> {
     };
     let container_id = desc.id.clone()?;
 
-    let container_cwd = match tracked_container_cwd(&docker, &container_ref, &container_id).await {
+    let container_cwd = match tracked_container_cwd(&docker, &container_ref, &container_id, client_pid).await {
         Some(cwd) => cwd,
         None => {
             macro_log::d!("[cwd] 无跟踪的存活 exec 会话，回退容器内枚举发现");
@@ -186,11 +215,17 @@ pub async fn resolve_container_cwd(cmdline: &str) -> Option<ContainerCwd> {
     Some(ContainerCwd { container_id, container_ref, container_cwd })
 }
 
-/// 经事件跟踪的 exec 会话解析容器 cwd：最新会话 → inspect_exec 校验存活 →
-/// 宿主 pid 映射容器 pid → 容器内 readlink。任一步失败返回 None（调用方兜底）。
-async fn tracked_container_cwd(docker: &Docker, container_ref: &str, container_id: &str) -> Option<String> {
+/// 经事件跟踪的 exec 会话解析容器 cwd：按客户端启动时间关联会话 → inspect_exec
+/// 校验存活 → 宿主 pid 映射容器 pid → 容器内 readlink。任一步失败返回 None（调用方兜底）。
+async fn tracked_container_cwd(
+    docker: &Docker,
+    container_ref: &str,
+    container_id: &str,
+    client_pid: u32,
+) -> Option<String> {
     let tracker = TRACKER.get()?;
-    let exec_id = tracker.latest_of(&[container_ref, container_id])?;
+    let client_start = crate::common::unix::proc_start_time(client_pid);
+    let exec_id = tracker.latest_of(&[container_ref, container_id], client_start)?;
     let Ok(inspect) = docker.inspect_exec(&exec_id).await else {
         macro_log::d!("[cwd] exec {exec_id} inspect 失败（会话可能已结束）");
         return None;
@@ -508,6 +543,38 @@ mod tests {
             .args(["rm", "-f", "rc-it-push"])
             .status()
             .expect("docker rm 失败");
+    }
+
+    /// 同容器多 exec 会话按客户端启动时间相关：各客户端命中自己的会话，
+    /// 无客户端时间时回退最近登记
+    #[test]
+    fn tracker_latest_of_correlates_client_start() {
+        let tracker = ExecTracker::default();
+        // 以当前时刻为基准构造会话时间（insert 内有 TTL 清理，不能用远古时间）
+        let base = SystemTime::now() - Duration::from_secs(120);
+        let s1 = base + Duration::from_secs(10); // 客户端 A 的会话登记时刻
+        let s2 = base + Duration::from_secs(50); // 客户端 B 的会话登记时刻
+        tracker.insert("exec-a".into(), "ctr".into(), s1);
+        tracker.insert("exec-b".into(), "ctr".into(), s2);
+
+        // 客户端 A 启动于 9s（exec_start 10s 紧随其后）
+        let a_start = base + Duration::from_secs(9);
+        assert_eq!(tracker.latest_of(&["ctr"], Some(a_start)).as_deref(), Some("exec-a"));
+        // 客户端 B 启动于 49s：A 的会话被"晚于客户端启动"过滤 + 时间差更大而排除
+        let b_start = base + Duration::from_secs(49);
+        assert_eq!(tracker.latest_of(&["ctr"], Some(b_start)).as_deref(), Some("exec-b"));
+        // 容器名或 ID 任一匹配；不匹配的容器无会话
+        assert_eq!(tracker.latest_of(&["other"], Some(b_start)), None);
+        // 无客户端启动时间 → 最近登记的会话
+        assert_eq!(tracker.latest_of(&["ctr"], None).as_deref(), Some("exec-b"));
+    }
+
+    /// proc_start_time：存活进程返回早于当前的绝对时间；不存在进程返回 None
+    #[test]
+    fn proc_start_time_cases() {
+        let t = crate::common::unix::proc_start_time(std::process::id()).expect("自身启动时刻应可读");
+        assert!(t <= SystemTime::now());
+        assert_eq!(crate::common::unix::proc_start_time(u32::MAX - 1), None);
     }
 
     /// 容器引用提取：布尔 flag、内联取值、独立取值、镜像命令词均可跳过

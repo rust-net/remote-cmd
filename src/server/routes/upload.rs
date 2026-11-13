@@ -256,7 +256,7 @@ async fn session(
         if init.probe && existed {
             let path = match &target {
                 UploadTarget::Host(_) => display_path(&dir),
-                UploadTarget::Container { ctr, .. } => format!("ctr:{}:{}", ctr.container_ref, ctr_dir(ctr, &rel)),
+                UploadTarget::Container { ctr, .. } => ctr_dir(ctr, &rel),
             };
             let _ = socket
                 .send(Message::Text(
@@ -298,7 +298,7 @@ async fn session(
             UploadTarget::Container { ctr, .. } => {
                 crate::common::docker::mkdir_p(&ctr.container_id, &ctr_dir(ctr, &actual_rel))
                     .await
-                    .map(|_| format!("ctr:{}:{}", ctr.container_ref, ctr_dir(ctr, &actual_rel)))
+                    .map(|_| ctr_dir(ctr, &actual_rel))
                     .map_err(|e| e.to_string())
             }
         };
@@ -442,8 +442,10 @@ async fn session(
         return;
     }
 
-    // 容器目标：接收完成后推入容器内目标目录（本地暂存文件用后即删）
+    // 容器目标：接收完成后推入容器内目标目录（本地暂存文件用后即删）。
+    // 客户端回执为纯容器路径；审计日志保持 ctr:<容器>:<路径> 前缀以便区分容器上传
     let mut path = display_path(&dest);
+    let mut client_path: Option<String> = None;
     let mut audit_dir = dir.display().to_string();
     if let UploadTarget::Container { ctr, .. } = &target {
         let dest_dir = ctr_dir(ctr, &rel);
@@ -475,11 +477,9 @@ async fn session(
         }
         match crate::common::docker::push_file(&ctr.container_id, &dest_dir, &dest_name, &dest).await {
             Ok(_) => {
-                path = format!(
-                    "ctr:{}:{}",
-                    ctr.container_ref,
-                    crate::common::docker::container_join(&dest_dir, &dest_name)
-                );
+                let container_path = crate::common::docker::container_join(&dest_dir, &dest_name);
+                path = format!("ctr:{}:{}", ctr.container_ref, container_path);
+                client_path = Some(container_path);
                 audit_dir = dest_dir;
                 // 清理本地暂存（目录非空时保留）
                 let _ = tokio::fs::remove_file(&dest).await;
@@ -501,9 +501,11 @@ async fn session(
         &hostname,
         Some(serde_json::json!({ "name": name, "bytes": total, "path": path, "dir": audit_dir, "ip": addr.ip().to_string() })),
     );
+    // 客户端回执：容器会话为纯容器路径，宿主会话为落地文件路径
+    let reply_path = client_path.unwrap_or_else(|| path.clone());
     let _ = socket
         .send(Message::Text(
-            serde_json::json!({ "type": "uploaded", "path": path, "bytes": total }).to_string().into(),
+            serde_json::json!({ "type": "uploaded", "path": reply_path, "bytes": total }).to_string().into(),
         ))
         .await;
     let _ = socket.close().await;
