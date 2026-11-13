@@ -30,7 +30,7 @@ use futures::StreamExt;
 static TRACKER: OnceLock<ExecTracker> = OnceLock::new();
 
 /// 容器内 cwd 解析结果（上传直接写入容器内，不做宿主 bind 映射）
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ContainerCwd {
     /// 容器完整 ID（后续 archive/exec API 调用使用）
     pub container_id: String,
@@ -65,12 +65,13 @@ impl ExecTracker {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(exec_id);
     }
 
-    /// 指定容器上最近创建的 exec 会话 id
-    fn latest_of(&self, container_id: &str) -> Option<String> {
+    /// 指定容器上最近创建的 exec 会话 id（按容器名或完整 ID 任一匹配：
+    /// 事件 attributes 只带容器名，查询侧两者都有）
+    fn latest_of(&self, containers: &[&str]) -> Option<String> {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions
             .iter()
-            .filter(|(_, s)| s.container_id == container_id)
+            .filter(|(_, s)| containers.iter().any(|c| *c == s.container_id))
             .max_by_key(|(_, s)| s.started_at)
             .map(|(id, _)| id.clone())
     }
@@ -124,6 +125,8 @@ async fn run_event_loop(docker: &Docker) -> String {
 
 /// 处理单条事件：exec_start 登记会话、exec_die 移除；其余打点便于诊断事件流投递。
 /// exec_create 不登记（未启动的 exec 不构成"用户正在其中"的会话）。
+/// 注意：exec 事件的 attributes 无 `container` 字段，容器标识在 `name`（容器名）；
+/// `container` 字段仅在部分 daemon 版本出现，两者任取其一。
 fn handle_event(msg: EventMessage) {
     let Some(tracker) = TRACKER.get() else { return };
     let Some(actor) = msg.actor else { return };
@@ -134,7 +137,11 @@ fn handle_event(msg: EventMessage) {
         .cloned()
         .or(actor.id.clone())
         .unwrap_or_default();
-    let container = attrs.get("container").cloned().unwrap_or_default();
+    let container = attrs
+        .get("container")
+        .or_else(|| attrs.get("name"))
+        .cloned()
+        .unwrap_or_default();
     let action = msg.action.clone().unwrap_or_default();
     macro_log::d!("[docker] 事件 typ={:?} action={action} exec={exec_id} container={container}", msg.typ);
     if exec_id.is_empty() || container.is_empty() {
@@ -148,11 +155,12 @@ fn handle_event(msg: EventMessage) {
 }
 
 /// docker exec 场景的 cwd 解析入口（cwd.rs resolve_process_cwd 调用）。
+/// `cmdline` 为 docker 客户端进程完整命令行（从中提取容器引用）。
 /// 优先用事件跟踪的 exec 会话精确定位；无跟踪会话（事件流中断 / watcher 刚启动 /
 /// daemon 重启）时回退容器内枚举发现。整体失败返回 None，调用方回退宿主 shell cwd。
-pub async fn resolve_container_cwd(info: &crate::common::unix::ProcessInfo) -> Option<ContainerCwd> {
-    let Some(container_ref) = container_ref_from_cmdline(&info.cmdline) else {
-        macro_log::d!("[cwd] docker 客户端 cmdline 未识别容器引用: {:?}", info.cmdline);
+pub async fn resolve_container_cwd(cmdline: &str) -> Option<ContainerCwd> {
+    let Some(container_ref) = container_ref_from_cmdline(cmdline) else {
+        macro_log::d!("[cwd] docker 客户端 cmdline 未识别容器引用: {cmdline:?}");
         return None;
     };
     macro_log::d!("[cwd] docker exec 容器引用: {container_ref}");
@@ -167,7 +175,7 @@ pub async fn resolve_container_cwd(info: &crate::common::unix::ProcessInfo) -> O
     };
     let container_id = desc.id.clone()?;
 
-    let container_cwd = match tracked_container_cwd(&docker, &container_id).await {
+    let container_cwd = match tracked_container_cwd(&docker, &container_ref, &container_id).await {
         Some(cwd) => cwd,
         None => {
             macro_log::d!("[cwd] 无跟踪的存活 exec 会话，回退容器内枚举发现");
@@ -180,9 +188,9 @@ pub async fn resolve_container_cwd(info: &crate::common::unix::ProcessInfo) -> O
 
 /// 经事件跟踪的 exec 会话解析容器 cwd：最新会话 → inspect_exec 校验存活 →
 /// 宿主 pid 映射容器 pid → 容器内 readlink。任一步失败返回 None（调用方兜底）。
-async fn tracked_container_cwd(docker: &Docker, container_id: &str) -> Option<String> {
+async fn tracked_container_cwd(docker: &Docker, container_ref: &str, container_id: &str) -> Option<String> {
     let tracker = TRACKER.get()?;
-    let exec_id = tracker.latest_of(container_id)?;
+    let exec_id = tracker.latest_of(&[container_ref, container_id])?;
     let Ok(inspect) = docker.inspect_exec(&exec_id).await else {
         macro_log::d!("[cwd] exec {exec_id} inspect 失败（会话可能已结束）");
         return None;

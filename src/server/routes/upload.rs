@@ -451,7 +451,7 @@ async fn session(
         let mut dest_name = name.clone();
         if !init.overwrite {
             let (stem, ext) = match name.rsplit_once('.') {
-                Some((s, e)) if !s.is_empty() => (&name[..s.len()], &name[s.len()..]),
+                Some((s, _e)) if !s.is_empty() => (&name[..s.len()], &name[s.len()..]),
                 _ => (name.as_str(), ""),
             };
             let mut i = 1u32;

@@ -33,6 +33,14 @@ pub async fn find_client_type(shell_pid: u32) -> ClientType {
     }
 }
 
+/// 读取进程完整命令行（/proc/<pid>/cmdline，NUL 转空格；不可读/为空返回 None）
+pub fn proc_cmdline(pid: u32) -> Option<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|data| String::from_utf8_lossy(&data).replace('\0', " ").trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// 获取进程 stdin 控制终端路径（/dev/pts/N、/dev/tty、/dev/pty）
 ///
 /// `pid`：进程 ID，`None` 表示当前进程
@@ -102,12 +110,7 @@ pub fn enumerate_processes(tty: Option<String>) -> Vec<ProcessInfo> {
             continue;
         };
         // 完整命令行：cmdline 以 NUL 分隔；内核线程 cmdline 为空则回退 comm
-        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
-            .map(|data| {
-                let s = String::from_utf8_lossy(&data).replace('\0', " ");
-                s.trim().to_string()
-            })
-            .unwrap_or_default();
+        let cmdline = proc_cmdline(pid).unwrap_or_default();
         let cwd = get_cwd(pid).unwrap_or_default();
         processes.push(ProcessInfo {
             pid,
@@ -217,13 +220,22 @@ mod tests {
         let ClientType::DockerClient(info) = find_client_type(pane.pane_pid).await else {
             panic!("pane 前台未识别为 docker 客户端");
         };
-        let cwd = crate::common::docker::resolve_container_cwd(&info)
+        let cwd = crate::common::docker::resolve_container_cwd(&info.cmdline)
             .await
             .expect("容器 cwd 解析失败");
         assert_eq!(cwd.container_cwd, "/etc");
         // 容器引用与 ID 均已解析（文件将直接推入容器）
         assert_eq!(cwd.container_ref, "rc-it-exec");
         assert!(cwd.container_id.len() >= 12);
+
+        // 全链路：外层注册 shell → TmuxClient → pane 前台 docker 客户端判定 → 容器 cwd
+        // （tmux 内 docker exec 场景，不再回退宿主 pane_current_path）
+        match crate::common::cwd::resolve_process_cwd(child.process_id().unwrap()).await {
+            Some(crate::common::cwd::ProcessCwd::Container(cwd)) => {
+                assert_eq!(cwd.container_cwd, "/etc");
+            }
+            other => panic!("期望容器内 cwd，实际 {other:?}"),
+        }
 
         child.kill().unwrap();
         child.wait().unwrap();
